@@ -7,3 +7,8 @@ service_account.json
 
 .DS_Store
 Thumbs.db
+
+# csv files
+simplyhired_cleaned_final.csv
+simplyhired_jobs_combined.csv
+simplyhired_final_cleaned.csv
