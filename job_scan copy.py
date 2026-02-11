@@ -6,6 +6,12 @@ import os
 import re
 from bs4 import BeautifulSoup
 
+# Check for torch availability for the summarizer
+try:
+    import torch
+except ImportError:
+    torch = None
+
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -16,7 +22,7 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from webdriver_manager.chrome import ChromeDriverManager
 
 # ---------- CONFIG ----------
-KEYWORDS = ["data scientist", "data analyst"]
+KEYWORDS = ["statistical analysis, python, sql, modeling"]
 LOCATION = "Toronto, ON"
 RADIUS = 50
 OUTPUT_FILE = "simplyhired_final_cleaned.csv"
@@ -196,18 +202,88 @@ def parse_job_data(driver, card, prev_desc):
     data["scraped_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     return data
 
-def save_job(job_data):
-    df = pd.DataFrame([job_data])
-    header = not os.path.exists(OUTPUT_FILE)
-    df.to_csv(OUTPUT_FILE, mode="a", header=header, index=False, encoding="utf-8")
+# --- NEW FUNCTION: SUMMARIZE ONLY THE NEW BUFFER ---
+def summarize_new_jobs_buffer(new_jobs_list):
+    """
+    Takes the list of newly scraped dictionaries, converts to DataFrame,
+    runs summarization on them, and returns the DataFrame ready for appending.
+    """
+    if not new_jobs_list:
+        return pd.DataFrame()
+
+    print(f"\n--- Summarizing {len(new_jobs_list)} NEW jobs ---")
+
+    # Try importing required ML libraries; skip if not available
+    try:
+        from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+    except ImportError:
+        print("Transformers not installed. Skipping summarization.")
+        return pd.DataFrame(new_jobs_list)
+
+    # Use GPU if available, otherwise fall back to CPU
+    device = "cuda" if torch and torch.cuda.is_available() else "cpu"
+    print(f"Running on device: {device.upper()}")
+
+    # Load tokenizer and summarization model
+    tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-large")
+    model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-large").to(device)
+
+    df = pd.DataFrame(new_jobs_list)
+    
+    def process_text(text):
+        # Skip empty, missing, or very short descriptions
+        if not text or text == "N/A" or len(str(text).split()) < 80: return text
+        try:
+            # Split long text into manageable word chunks
+            words = str(text).split()
+            chunk_size = 450
+            chunks = [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
+            intermediate = []
+
+            # Summarize each chunk individually
+            for chunk in chunks:
+                prompt = f"Summarize technical skills and duties in this job text: \n\n{chunk}"
+                inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(device)
+                outputs = model.generate(inputs["input_ids"], max_length=150)
+                intermediate.append(tokenizer.decode(outputs[0], skip_special_tokens=True))
+            
+            # Combine chunk summaries into one polished job summary
+            final_prompt = (
+                "Write a professional paragraph job summary listing tech stack and responsibilities: \n\n"
+                + " ".join(intermediate)
+            )
+            inputs = tokenizer(final_prompt, return_tensors="pt", truncation=True, max_length=1024).to(device)
+            outputs = model.generate(inputs["input_ids"], max_length=300, min_length=100, num_beams=4)
+            return tokenizer.decode(outputs[0], skip_special_tokens=True)
+        except:
+            return text
+
+    # Apply summarization to all new job descriptions
+    df["description"] = df["description"].apply(process_text)
+    df["salary"] = df["salary"].replace(r"^\s*$", "N/A", regex=True).fillna("N/A")
+    
+    return df
 
 def run():
-    # Remove existing output file to start fresh
-    if os.path.exists(OUTPUT_FILE): os.remove(OUTPUT_FILE)
+    # --- UPDATED: DO NOT REMOVE FILE. LOAD EXISTING URLs ---
+    seen_urls = set()
+    if os.path.exists(OUTPUT_FILE):
+        try:
+            old_df = pd.read_csv(OUTPUT_FILE)
+            if "url" in old_df.columns:
+                seen_urls = set(old_df["url"].dropna().tolist())
+            print(f"Found existing file with {len(seen_urls)} jobs. Will append only new ones.")
+        except Exception as e:
+            print(f"Could not read existing file: {e}. Starting fresh.")
+    else:
+        print("No existing file found. Starting fresh.")
 
     # Start a Selenium-controlled browser session
     driver = make_driver()
-    total_saved = 0
+    
+    # --- UPDATED: Buffer to hold ONLY new jobs for this run ---
+    new_jobs_buffer = [] 
+    total_saved_this_run = 0
 
     try:
         for kw in KEYWORDS:
@@ -236,7 +312,7 @@ def run():
 
                 for i in range(len(cards)):
                     # Stop once the global job limit is reached
-                    if total_saved >= MAX_JOBS_TO_SCRAPE:
+                    if total_saved_this_run >= MAX_JOBS_TO_SCRAPE:
                         break
                     try:
                         # Re-fetch cards to avoid stale element references
@@ -245,6 +321,29 @@ def run():
                             cards = driver.find_elements(By.CSS_SELECTOR, "#job-list > li")
 
                         card = cards[i]
+
+                        # --- NEW STEP: CHECK URL BEFORE CLICKING ---
+                        # We try to grab the href immediately to see if we already have this job.
+                        # This saves massive time by not clicking/parsing old jobs.
+                        try:
+                            temp_soup = BeautifulSoup(card.get_attribute("outerHTML"), "lxml")
+                            temp_title_tag = (
+                                temp_soup.find("a", class_=lambda x: x and "jobTitle" in x)
+                                or temp_soup.find("a")
+                            )
+                            if temp_title_tag:
+                                raw_href = temp_title_tag.get("href", "")
+                                check_url = (
+                                    "https://www.simplyhired.ca" + raw_href.split("?")[0]
+                                    if raw_href and not raw_href.startswith("http")
+                                    else raw_href
+                                )
+                                if check_url in seen_urls:
+                                    # Skip silently or log debug
+                                    continue
+                        except:
+                            pass # If check fails, continue to normal processing just in case
+                        # -------------------------------------------
 
                         # --- ADVANCED FILTERING LOGIC START ---
                         # Extract title text safely for checking
@@ -277,6 +376,11 @@ def run():
                         # Parse data from one job card
                         job_data = parse_job_data(driver, card, prev_description)
                         if job_data:
+                            # Final check to ensure we don't duplicate (in case the pre-check failed)
+                            if job_data['url'] in seen_urls:
+                                print("   [DUPLICATE] Already in CSV.")
+                                continue
+
                             prev_description = job_data["description"]
                             
                             # --- DECIDE TO SAVE BASED ON RELEVANCE ---
@@ -296,14 +400,17 @@ def run():
                                         print(f"   [SKIP AMBIGUOUS] {raw_title} (No tech keywords found)")
                             
                             if should_save:
-                                save_job(job_data)
-                                total_saved += 1
+                                # --- UPDATED: APPEND TO LIST, DON'T SAVE TO CSV YET ---
+                                new_jobs_buffer.append(job_data)
+                                seen_urls.add(job_data['url']) # Add to seen so we don't grab it again in this run
+                                total_saved_this_run += 1
+                                print(f"   >>> Buffered New Job. Total New: {total_saved_this_run}")
                                 
                     except:
                         continue
 
                 # Stop pagination if job limit reached
-                if total_saved >= MAX_JOBS_TO_SCRAPE:
+                if total_saved_this_run >= MAX_JOBS_TO_SCRAPE:
                     break
 
                 try:
@@ -317,82 +424,21 @@ def run():
     finally:
         # Always close the browser
         driver.quit()
-        print(f"\nScraping complete. Saved {total_saved} jobs (before deduplication).")
         
-        # --- REMOVE DUPLICATES (Added as requested) ---
-        if os.path.exists(OUTPUT_FILE):
-            print("Checking for duplicates...")
-            try:
-                df = pd.read_csv(OUTPUT_FILE)
-                if "url" in df.columns:
-                    initial_count = len(df)
-                    df.drop_duplicates(subset=["url"], keep="first", inplace=True)
-                    final_count = len(df)
-                    df.to_csv(OUTPUT_FILE, index=False, encoding="utf-8")
-                    print(f"Duplicates removed: {initial_count - final_count}. Final unique jobs: {final_count}")
-            except Exception as e:
-                print(f"Error removing duplicates: {e}")
-        # -----------------------------------------------
-
-def summarize_final_dataframe():
-    # Exit if there is no output file to summarize
-    if not os.path.exists(OUTPUT_FILE): return
-
-    # Try importing required ML libraries; skip if not available
-    try:
-        from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-        import torch
-    except ImportError: return
-
-    # Use GPU if available, otherwise fall back to CPU
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"\n--- Starting GPU Summarization on {device.upper()} ---")
-
-    # Load tokenizer and summarization model
-    tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-large")
-    model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-large").to(device)
-
-    # Load scraped job data
-    df = pd.read_csv(OUTPUT_FILE)
-    
-    def process_text(text):
-        # Skip empty, missing, or very short descriptions
-        if not text or text == "N/A" or len(str(text).split()) < 80: return text
-        try:
-            # Split long text into manageable word chunks
-            words = str(text).split()
-            chunk_size = 450
-            chunks = [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
-            intermediate = []
-
-            # Summarize each chunk individually
-            for chunk in chunks:
-                prompt = f"Summarize technical skills and duties in this job text: \n\n{chunk}"
-                inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(device)
-                outputs = model.generate(inputs["input_ids"], max_length=150)
-                intermediate.append(tokenizer.decode(outputs[0], skip_special_tokens=True))
+        # --- PROCESS NEW JOBS ---
+        if new_jobs_buffer:
+            print(f"\nScraping complete. Found {len(new_jobs_buffer)} NEW jobs.")
             
-            # Combine chunk summaries into one polished job summary
-            final_prompt = (
-                "Write a professional paragraph job summary listing tech stack and responsibilities: \n\n"
-                + " ".join(intermediate)
-            )
-            inputs = tokenizer(final_prompt, return_tensors="pt", truncation=True, max_length=1024).to(device)
-            outputs = model.generate(inputs["input_ids"], max_length=300, min_length=100, num_beams=4)
-            return tokenizer.decode(outputs[0], skip_special_tokens=True)
-        except:
-            return text
-
-    # Apply summarization to all job descriptions
-    print(f"Summarizing {len(df)} jobs...")
-    df["description"] = df["description"].apply(process_text)
-
-    df["salary"] = df["salary"].replace(r"^\s*$", "N/A", regex=True).fillna("N/A")
-
-    # Overwrite CSV with summarized descriptions
-    df.to_csv(OUTPUT_FILE, index=False)
-    print("Success: Final CSV updated.")
+            # Summarize ONLY the new jobs
+            df_final_new = summarize_new_jobs_buffer(new_jobs_buffer)
+            
+            # Append to the existing CSV
+            # If file doesn't exist, header=True. If it exists, header=False
+            header = not os.path.exists(OUTPUT_FILE)
+            df_final_new.to_csv(OUTPUT_FILE, mode="a", header=header, index=False, encoding="utf-8")
+            print(f"Success: Appended {len(df_final_new)} summarized jobs to {OUTPUT_FILE}.")
+        else:
+            print("\nScraping complete. No new jobs found to append.")
 
 if __name__ == "__main__":
     run()
-    summarize_final_dataframe()
