@@ -656,55 +656,81 @@ def scrape_linkedin_authenticated(driver, seen_signatures, seen_urls, new_jobs_b
 # ==========================================
 # VERIFY AND CLEAN EXISTING CSV
 # ==========================================
-def check_single_url(url):
-    if not isinstance(url, str) or not url.startswith("http"):
-        return False
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-
-    try:
-        r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code in (404, 410):
-            return False
-        content_lower = r.text.lower()
-        if "simplyhired" in url:
-            if "job no longer available" in content_lower:
-                return False
-            if "this job has expired" in content_lower:
-                return False
-        if "linkedin" in url:
-            if "no longer accepting applications" in content_lower:
-                return False
-            if "job is no longer available" in content_lower:
-                return False
-        return True
-    except requests.exceptions.RequestException:
-        return False
-
-
 def verify_and_clean_data():
     if not os.path.exists(OUTPUT_FILE):
         print(f"File {OUTPUT_FILE} not found.")
         return
 
     print(f"\n=== VERIFYING URLS IN {OUTPUT_FILE} ===")
+    print("Method: Checking if CSV Job Title exists on the webpage (using Selenium)...")
 
     df = pd.read_csv(OUTPUT_FILE)
-    if "url" not in df.columns:
-        print("Error: CSV does not have a 'url' column.")
+    if "url" not in df.columns or "title" not in df.columns:
+        print("Error: CSV must have 'url' and 'title' columns.")
         return
 
     original_count = len(df)
-    urls = df["url"].tolist()
+    valid_mask = []
+    
+    driver = make_driver()
 
-    print(f"Loaded {original_count} rows. Checking URLs in parallel...")
+    try:
+        for index, row in df.iterrows():
+            url = row.get("url", "")
+            raw_title = str(row.get("title", ""))
+            csv_title = fix_doubled_title(raw_title).strip()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        results = list(executor.map(check_single_url, urls))
+            if not isinstance(url, str) or not url.startswith("http") or not csv_title:
+                valid_mask.append(False)
+                continue
 
-    df["is_valid"] = results
+            try:
+                driver.get(url)
+                time.sleep(1.2) # Wait for DOM
+
+                body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+                current_url = driver.current_url.lower()
+                csv_title_lower = csv_title.lower()
+
+                # 1. Negative Checks
+                is_dead = False
+                if "simplyhired" in url and "/job/" in url and "/search" in current_url:
+                     is_dead = True
+                     print(f"   [REMOVING - Redirected] {csv_title}")
+
+                dead_phrases = [
+                    "this job posting is temporarily unavailable",
+                    "job no longer available",
+                    "this job has expired",
+                    "no longer accepting applications",
+                    "job is no longer available"
+                ]
+                if any(phrase in body_text for phrase in dead_phrases):
+                    is_dead = True
+                    print(f"   [REMOVING - Unavailable Msg] {csv_title}")
+
+                if is_dead:
+                    valid_mask.append(False)
+                    continue
+
+                # 2. Positive Check (Title Match)
+                if csv_title_lower in body_text:
+                    valid_mask.append(True)
+                else:
+                    print(f"   [REMOVING - Title Mismatch] CSV Title: '{csv_title}' not found on page.")
+                    valid_mask.append(False)
+
+            except Exception as e:
+                print(f"   [ERROR verifying] {url}: {e}")
+                valid_mask.append(True) # Keep on crash
+
+            if (index + 1) % 10 == 0:
+                print(f"   Checked {index + 1}/{original_count}...")
+
+    finally:
+        driver.quit()
+
+    df["is_valid"] = valid_mask
     df_clean = df[df["is_valid"] == True].drop(columns=["is_valid"])
     removed_count = original_count - len(df_clean)
 
@@ -919,15 +945,33 @@ def run_scraper():
             print("\nScraping complete. No new jobs found.")
 
 
+def remove_csv_duplicates():
+    if not os.path.exists(OUTPUT_FILE):
+        print(f"{OUTPUT_FILE} not found.")
+        return
+    
+    df = pd.read_csv(OUTPUT_FILE)
+    original_count = len(df)
+    
+    # Remove duplicates keeping the first occurrence
+    df = df.drop_duplicates(subset=["url"], keep="first")
+    
+    df.to_csv(OUTPUT_FILE, index=False)
+    print(f"Done. Removed {original_count - len(df)} duplicates. Total jobs: {len(df)}")
+
+
 if __name__ == "__main__":
     print("What would you like to do?")
     print("1. SCRAPE New Jobs (SimplyHired + LinkedIn)")
     print("2. VERIFY and CLEAN existing URLs in CSV")
-    choice = input("Enter 1 or 2: ").strip()
+    print("3. REMOVE Duplicates from CSV (by URL)")
+    choice = input("Enter 1, 2, or 3: ").strip()
 
     if choice == "1":
         run_scraper()
     elif choice == "2":
         verify_and_clean_data()
+    elif choice == "3":
+        remove_csv_duplicates()
     else:
         print("Invalid choice. Exiting.")
