@@ -28,12 +28,12 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 
 # ---------- CONFIG ----------
-KEYWORDS = ["data analytics, statistical modeling"]
+KEYWORDS = ["data scientist", "data analyst"]
 LOCATION = "Toronto, ON"
 RADIUS = 50
 OUTPUT_FILE = "simplyhired_final_cleaned.csv"
-MAX_JOBS_TO_SCRAPE = 60
-MAX_PAGES_PER_KEYWORD = 3
+MAX_JOBS_TO_SCRAPE = 500
+MAX_PAGES_PER_KEYWORD = 18
 
 # Salary reliability controls
 SALARY_RETRIES = 3
@@ -944,21 +944,123 @@ def run_scraper():
         else:
             print("\nScraping complete. No new jobs found.")
 
-
 def remove_csv_duplicates():
     if not os.path.exists(OUTPUT_FILE):
-        print(f"{OUTPUT_FILE} not found.")
+        print(f"File {OUTPUT_FILE} not found.")
         return
-    
+
+    print(f"\n=== CLEANING TITLES & REMOVING DUPLICATES ===")
     df = pd.read_csv(OUTPUT_FILE)
     original_count = len(df)
-    
-    # Remove duplicates keeping the first occurrence
-    df = df.drop_duplicates(subset=["url"], keep="first")
-    
-    df.to_csv(OUTPUT_FILE, index=False)
-    print(f"Done. Removed {original_count - len(df)} duplicates. Total jobs: {len(df)}")
 
+    # Ensure columns exist and fill NaNs
+    for col in ["title", "company", "url"]:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str)
+
+    # ---------------------------------------------------------
+    # 1. DEFINE AGGRESSIVE CLEANING LOGIC
+    # ---------------------------------------------------------
+    def sanitize_title(text):
+        if not text: return ""
+        
+        # A. Remove "with verification" and other noise (Case Insensitive)
+        clean = text
+        noise_phrases = [
+            "with verification", 
+            " - Job", 
+            "(f/m/d)", 
+            "(m/f/d)"
+        ]
+        for phrase in noise_phrases:
+            pattern = re.compile(re.escape(phrase), re.IGNORECASE)
+            clean = pattern.sub("", clean)
+
+        # B. Normalize whitespace
+        clean = " ".join(clean.split())
+
+        # C. Fix "Doubled" Titles (e.g. "Data Scientist Data Scientist")
+        # Logic: Split into words. If the first half equals the second half, cut it.
+        words = clean.split()
+        if len(words) >= 2 and len(words) % 2 == 0:
+            mid = len(words) // 2
+            first_half = words[:mid]
+            second_half = words[mid:]
+            
+            # Case-insensitive comparison of the two halves
+            if [w.lower() for w in first_half] == [w.lower() for w in second_half]:
+                return " ".join(first_half)
+
+        # D. Fix Concatenated Doubling (e.g. "Data ScientistData Scientist")
+        # This checks if the string is exactly repeated without a space in the middle
+        if len(clean) > 6 and len(clean) % 2 == 0:
+            mid = len(clean) // 2
+            s1, s2 = clean[:mid], clean[mid:]
+            if s1.lower() == s2.lower():
+                return s1
+
+        return clean
+
+    # ---------------------------------------------------------
+    # 2. APPLY CLEANING TO THE DATAFRAME
+    # ---------------------------------------------------------
+    print("   Sanitizing titles (removing 'with verification' and doubled words)...")
+    # This actually UPDATES the 'title' column in the dataframe
+    df["title"] = df["title"].apply(sanitize_title)
+
+    # ---------------------------------------------------------
+    # 3. DEDUPLICATE BASED ON CLEANED DATA
+    # ---------------------------------------------------------
+    print("   Checking for duplicates...")
+
+    # Create a normalized signature for comparison (Company + Title)
+    # We strip non-alphanumeric chars to ensure "Intact." == "Intact"
+    def make_signature(row):
+        t = re.sub(r'[^a-z0-9]', '', row["title"].lower())
+        c = re.sub(r'[^a-z0-9]', '', row["company"].lower())
+        return f"{c}_{t}"
+
+    df["_sig"] = df.apply(make_signature, axis=1)
+
+    # Sort so that if we have duplicates, we prioritize:
+    # 1. The one with a URL (if one is missing)
+    # 2. The one with the shorter URL (usually SimplyHired or cleaner links)
+    # 3. Scraped most recently
+    df["_url_len"] = df["url"].apply(len)
+    
+    sort_cols = ["_sig", "_url_len"]
+    if "scraped_at" in df.columns:
+        sort_cols.append("scraped_at")
+        ascending_order = [True, True, False] # Sig asc, URL len asc, Date desc
+    else:
+        ascending_order = [True, True]
+
+    df = df.sort_values(by=sort_cols, ascending=ascending_order)
+
+    # Drop duplicates based on the signature (Company + Title)
+    df_clean = df.drop_duplicates(subset=["_sig"], keep="first")
+    
+    # Also drop duplicates on URL just in case
+    df_clean = df_clean.drop_duplicates(subset=["url"], keep="first")
+
+    # Clean up temp columns
+    df_clean = df_clean.drop(columns=["_sig", "_url_len"])
+
+    # ---------------------------------------------------------
+    # 4. SAVE
+    # ---------------------------------------------------------
+    removed_count = original_count - len(df_clean)
+    df_clean.to_csv(OUTPUT_FILE, index=False)
+    
+    print(f"   Done.")
+    print(f"   Original rows: {original_count}")
+    print(f"   Cleaned rows:  {len(df_clean)}")
+    print(f"   Removed:       {removed_count} duplicates.")
+    
+    # Verification output
+    print("\n   [Sample of cleaned titles]:")
+    print(df_clean[["title", "company"]].head(5).to_string(index=False))
 
 if __name__ == "__main__":
     print("What would you like to do?")
