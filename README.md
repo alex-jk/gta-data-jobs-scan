@@ -9,11 +9,21 @@ by salary and ranked by how well each posting matches your skill profile.
 ```bash
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -r requirements-core.txt
 ```
 
-`torch` is intentionally unpinned. It is only needed for the optional
-description summariser; the scraper and the salary pipeline run without it.
+`requirements-core.txt` is everything the scraper and the salary filter need.
+Use it unless you want the optional summariser or the notebook.
+
+`requirements.txt` is the full environment. It pulls in `transformers` and
+`accelerate`, and `accelerate` hard-depends on `torch`, so installing it
+downloads several hundred MB that the scrape and filter never touch. `torch`
+itself is deliberately unpinned: the CUDA builds are not on PyPI and break the
+install. For GPU summarisation, install it separately:
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu124
+```
 
 ## Running
 
