@@ -4,8 +4,12 @@ Tests for salary parsing, profile scoring and de-duplication.
 Runs under pytest, or standalone with `python test_pipeline.py`.
 """
 
+import os
+import tempfile
+
 import pandas as pd
 
+import job_scan
 from salary import best_salary, parse_salary, score_profile_fit
 from job_scan import canonical_url, dedupe_jobs, job_signature, sanitize_title
 
@@ -191,6 +195,90 @@ def test_dedupe_removes_real_duplicates():
     out = dedupe_jobs(df)
     assert len(out) == 2
     assert set(out["title"]) == {"Data Scientist", "Data Analyst"}
+
+
+# ---------------------------------------------------------------------------
+# Shortlist export
+# ---------------------------------------------------------------------------
+
+SAMPLE_ROWS = [
+    {
+        "title": "Senior Data Scientist",
+        "company": "RBC",
+        "url": "https://example.test/jobs/view/1",
+        "description": "Python, SQL and Dataiku. The salary range is "
+                       "$135,000 - $165,000 per year.",
+        "salary": "N/A",
+        "qualifications": "N/A",
+        "scraped_at": "2026-09-20 10:00:00",
+    },
+    {
+        "title": "Manager, Advanced Analytics",
+        "company": "TD",
+        "url": "https://example.test/jobs/view/2",
+        "description": "Lead a team using SQL, Power BI and statistical "
+                       "modelling. No compensation is stated.",
+        "salary": "N/A",
+        "qualifications": "N/A",
+        "scraped_at": "2026-09-21 11:00:00",
+    },
+    {
+        "title": "Data Analyst",
+        "company": "SmallCo",
+        "url": "https://example.test/jobs/view/3",
+        "description": "Excel and Tableau reporting. $70,000 a year.",
+        "salary": "$70,000 a year",
+        "qualifications": "N/A",
+        "scraped_at": "2026-09-18 08:00:00",
+    },
+]
+
+
+def _run_export(exclude_below=True):
+    """Run export_unique_jobs against a throwaway CSV and return the shortlist."""
+    tmpdir = tempfile.mkdtemp()
+    main_csv = os.path.join(tmpdir, "main.csv")
+    shortlist_csv = os.path.join(tmpdir, "shortlist.csv")
+    pd.DataFrame(SAMPLE_ROWS).to_csv(main_csv, index=False)
+
+    saved = (job_scan.OUTPUT_FILE, job_scan.UNIQUE_JOBS_FILE,
+             job_scan.EXCLUDE_BELOW_TARGET)
+    job_scan.OUTPUT_FILE = main_csv
+    job_scan.UNIQUE_JOBS_FILE = shortlist_csv
+    job_scan.EXCLUDE_BELOW_TARGET = exclude_below
+    try:
+        job_scan.export_unique_jobs()
+        return pd.read_csv(shortlist_csv)
+    finally:
+        (job_scan.OUTPUT_FILE, job_scan.UNIQUE_JOBS_FILE,
+         job_scan.EXCLUDE_BELOW_TARGET) = saved
+
+
+def test_shortlist_keeps_jobs_with_no_posted_salary():
+    """A missing salary means unknown, not rejected. Most employers omit it."""
+    out = _run_export()
+    assert "Manager, Advanced Analytics" in set(out["title"])
+    row = out[out["title"] == "Manager, Advanced Analytics"].iloc[0]
+    assert row["salary_status"] == job_scan.SALARY_STATUS_UNKNOWN
+
+
+def test_shortlist_excludes_confirmed_below_target():
+    out = _run_export()
+    assert "Data Analyst" not in set(out["title"])
+    assert set(out["title"]) == {"Senior Data Scientist", "Manager, Advanced Analytics"}
+
+
+def test_shortlist_can_keep_below_target_jobs():
+    out = _run_export(exclude_below=False)
+    assert "Data Analyst" in set(out["title"])
+    row = out[out["title"] == "Data Analyst"].iloc[0]
+    assert row["salary_status"] == job_scan.SALARY_STATUS_BELOW
+
+
+def test_shortlist_ranks_confirmed_matches_first():
+    out = _run_export()
+    assert out.iloc[0]["salary_status"] == job_scan.SALARY_STATUS_MEETS
+    assert out.iloc[0]["title"] == "Senior Data Scientist"
 
 
 if __name__ == "__main__":

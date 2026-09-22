@@ -37,15 +37,25 @@ that pause, the scrape has to run on a machine where you can see the browser.
 | File | Contents |
 | ---- | -------- |
 | `simplyhired_final_cleaned.csv` | Every unique posting scraped so far |
-| `unique_jobs_matched.csv` | Salary confirmed at or above the target |
-| `unique_jobs_salary_unknown.csv` | No salary published, ranked by profile fit |
+| `unique_jobs_shortlist.csv` | The shortlist, ranked |
 
-Postings whose published salary falls below the target are excluded from both
-shortlists but stay in the main CSV.
+Most employers never publish a salary, so a missing figure is treated as
+**unknown**, not as a failure to meet the target. Those postings stay in the
+shortlist and are ranked by profile fit. Only postings that publish a salary
+*and* fall below the target are dropped.
 
-Most postings never state a salary, so the "unknown" file is usually the larger
-of the two. It is kept separate rather than discarded so real leads are not
-hidden by a missing field.
+Every row carries a `salary_status` column, so the file can be re-sorted or
+re-filtered in a spreadsheet without rerunning anything:
+
+| `salary_status` | Meaning |
+| --------------- | ------- |
+| `meets_target` | Published salary reaches `SALARY_TARGET_CAD` |
+| `not_posted` | No salary published; kept and ranked by fit |
+| `below_target` | Published salary is under target; excluded by default |
+
+The shortlist is ordered with confirmed matches first, then unpublished
+salaries, each group ranked by `fit_score`. Set `EXCLUDE_BELOW_TARGET = False`
+to keep below-target postings too; they stay in the main CSV either way.
 
 ## Tuning
 
@@ -54,6 +64,8 @@ All knobs are constants at the top of `job_scan.py`:
 - `SALARY_TARGET_CAD` - minimum acceptable annual compensation. A posting
   qualifies when the **top** of its advertised range reaches this figure, so a
   range straddling the target is kept.
+- `EXCLUDE_BELOW_TARGET` - whether to drop postings whose published salary is
+  under the target. Never affects postings with no published salary.
 - `KEYWORDS`, `LOCATION`, `RADIUS` - what and where to search.
 - `STRONG_KEYWORDS` / `AMBIGUOUS_KEYWORDS` / `BAD_KEYWORDS` - title filtering.
   A strong title is kept outright; an ambiguous one is kept only if the

@@ -41,14 +41,24 @@ KEYWORDS = [
 LOCATION = "Toronto, ON"
 RADIUS = 50
 OUTPUT_FILE = "simplyhired_final_cleaned.csv"
-UNIQUE_JOBS_FILE = "unique_jobs_matched.csv"
-UNKNOWN_SALARY_FILE = "unique_jobs_salary_unknown.csv"
+UNIQUE_JOBS_FILE = "unique_jobs_shortlist.csv"
 MAX_JOBS_TO_SCRAPE = 500
 MAX_PAGES_PER_KEYWORD = 18
 
 # Minimum acceptable total annual compensation, in CAD. Postings are kept when
 # the TOP of their advertised range reaches this figure.
 SALARY_TARGET_CAD = 118_000
+
+# Drop postings that publish a salary below the target. Postings that publish
+# NO salary are never dropped by this: most employers omit compensation, so
+# treating a missing figure as a failure would hide the majority of real leads.
+# Set to False to keep below-target postings in the shortlist too.
+EXCLUDE_BELOW_TARGET = True
+
+# Values of the salary_status column in the exported shortlist.
+SALARY_STATUS_MEETS = "meets_target"
+SALARY_STATUS_UNKNOWN = "not_posted"
+SALARY_STATUS_BELOW = "below_target"
 
 # --- ADVANCED KEYWORD LOGIC ---
 # Only genuinely off-target roles belong here. Seniority words (manager, lead,
@@ -1176,12 +1186,16 @@ def enrich_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def export_unique_jobs(target: float = SALARY_TARGET_CAD):
-    """Produce the final shortlist: unique postings meeting the salary target.
+    """Produce the final shortlist of unique postings.
 
-    Writes two files, because most postings never state a salary and silently
-    dropping them would hide the majority of real leads:
-      * UNIQUE_JOBS_FILE      - salary confirmed at or above the target
-      * UNKNOWN_SALARY_FILE   - no salary published, ranked by profile fit
+    Most employers never publish a salary, so "no salary listed" is treated as
+    unknown, not as a failure to meet the target. Those postings stay in the
+    shortlist and are ranked by profile fit. Only postings that publish a
+    salary AND fall below the target are dropped, and only when
+    EXCLUDE_BELOW_TARGET is on.
+
+    Every row carries a salary_status column so the file can be re-sorted or
+    re-filtered in a spreadsheet without rerunning anything.
     """
     if not os.path.exists(OUTPUT_FILE):
         print(f"File {OUTPUT_FILE} not found. Run the scraper (option 1) first.")
@@ -1199,28 +1213,47 @@ def export_unique_jobs(target: float = SALARY_TARGET_CAD):
     has_salary = df["salary_max_annual"].astype(str).str.strip() != ""
     meets = df["meets_salary_target"].astype(bool)
 
-    matched = df[has_salary & meets].copy()
-    unknown = df[~has_salary].copy()
-    below = df[has_salary & ~meets]
+    df["salary_status"] = SALARY_STATUS_UNKNOWN
+    df.loc[has_salary & meets, "salary_status"] = SALARY_STATUS_MEETS
+    df.loc[has_salary & ~meets, "salary_status"] = SALARY_STATUS_BELOW
 
-    sort_cols = [c for c in ("salary_max_annual", "fit_score") if c in matched.columns]
-    if sort_cols and not matched.empty:
-        matched = matched.sort_values(by=sort_cols, ascending=False)
-    if "fit_score" in unknown.columns and not unknown.empty:
-        unknown = unknown.sort_values(by="fit_score", ascending=False)
-
-    matched.to_csv(UNIQUE_JOBS_FILE, index=False, encoding="utf-8")
-    unknown.to_csv(UNKNOWN_SALARY_FILE, index=False, encoding="utf-8")
     df.to_csv(OUTPUT_FILE, index=False, encoding="utf-8")
 
-    print(f"   Salary >= target : {len(matched):>4}  -> {UNIQUE_JOBS_FILE}")
-    print(f"   Salary not posted: {len(unknown):>4}  -> {UNKNOWN_SALARY_FILE}")
-    print(f"   Salary below tgt : {len(below):>4}  (excluded)")
+    shortlist = df if not EXCLUDE_BELOW_TARGET else df[df["salary_status"] != SALARY_STATUS_BELOW]
+    shortlist = shortlist.copy()
 
-    if not matched.empty:
-        cols = [c for c in ("title", "company", "salary", "fit_score") if c in matched.columns]
-        print("\n   [Top matches]")
-        print(matched[cols].head(10).to_string(index=False))
+    # Confirmed matches first, then unpublished salaries, each ranked by how
+    # well the posting fits the profile.
+    shortlist["_rank"] = shortlist["salary_status"].map(
+        {SALARY_STATUS_MEETS: 0, SALARY_STATUS_UNKNOWN: 1, SALARY_STATUS_BELOW: 2}
+    ).fillna(3)
+    sort_cols = ["_rank"] + [
+        c for c in ("fit_score", "salary_max_annual") if c in shortlist.columns
+    ]
+    shortlist = shortlist.sort_values(
+        by=sort_cols, ascending=[True] + [False] * (len(sort_cols) - 1)
+    ).drop(columns=["_rank"])
+
+    shortlist.to_csv(UNIQUE_JOBS_FILE, index=False, encoding="utf-8")
+
+    counts = df["salary_status"].value_counts()
+    n_meets = int(counts.get(SALARY_STATUS_MEETS, 0))
+    n_unknown = int(counts.get(SALARY_STATUS_UNKNOWN, 0))
+    n_below = int(counts.get(SALARY_STATUS_BELOW, 0))
+
+    print(f"   Salary >= target  : {n_meets:>4}  (in shortlist)")
+    print(f"   Salary not posted : {n_unknown:>4}  (in shortlist, ranked by fit)")
+    verb = "excluded" if EXCLUDE_BELOW_TARGET else "in shortlist"
+    print(f"   Salary below tgt  : {n_below:>4}  ({verb})")
+    print(f"\n   {len(shortlist)} jobs -> {UNIQUE_JOBS_FILE}")
+
+    if not shortlist.empty:
+        cols = [
+            c for c in ("title", "company", "salary", "salary_status", "fit_score")
+            if c in shortlist.columns
+        ]
+        print("\n   [Top of shortlist]")
+        print(shortlist[cols].head(10).to_string(index=False))
 
 
 def remove_csv_duplicates():

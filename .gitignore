@@ -15,5 +15,4 @@ simplyhired_final_cleaned.csv
 .~lock.simplyhired_final_cleaned.csv#
 simplyhired_final_cleaned_backup.csv
 # generated shortlists
-unique_jobs_matched.csv
-unique_jobs_salary_unknown.csv
+unique_jobs_shortlist.csv
