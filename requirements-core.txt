@@ -1,0 +1,21 @@
+# Minimal dependencies to scrape jobs and export the shortlist.
+#
+# Use this instead of requirements.txt unless you need the optional
+# flan-t5 description summariser or the analysis notebook.
+# requirements.txt pulls in transformers and accelerate, and accelerate
+# hard-depends on torch, so a full install downloads several hundred MB
+# that the scraper and salary filter never touch.
+#
+#   pip install -r requirements-core.txt
+
+pandas==3.0.0
+numpy==2.4.2
+beautifulsoup4==4.14.3
+lxml==6.0.2
+selenium==4.40.0
+webdriver-manager==4.0.2
+
+# Needed only by summarize_jobs_data.ipynb:
+# scikit-learn==1.7.2
+# scipy==1.16.2
+# ipykernel==7.1.0

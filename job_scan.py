@@ -1,87 +1,110 @@
-import time
-import random
-import pandas as pd
-import logging
 import os
+import random
 import re
-import requests
-import concurrent.futures
+import time
+from urllib.parse import urlsplit
+
+import pandas as pd
 from bs4 import BeautifulSoup
 
-# Check for torch availability for the summarizer
-try:
-    import torch
-except ImportError:
-    torch = None
+from salary import best_salary, score_profile_fit
 
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import (
-    TimeoutException, NoSuchElementException,
-    ElementClickInterceptedException, StaleElementReferenceException
-)
-from webdriver_manager.chrome import ChromeDriverManager
+# Selenium is only needed for the scraping/verification paths. The cleaning,
+# de-duplication and export paths run on a plain CSV, so importing this module
+# must not require a browser stack to be installed.
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.common.exceptions import NoSuchElementException
+    from webdriver_manager.chrome import ChromeDriverManager
+
+    SELENIUM_AVAILABLE = True
+    SELENIUM_IMPORT_ERROR = None
+except ImportError as exc:  # pragma: no cover - depends on local install
+    SELENIUM_AVAILABLE = False
+    SELENIUM_IMPORT_ERROR = exc
+    NoSuchElementException = Exception
 
 
 # ---------- CONFIG ----------
-KEYWORDS = ["data scientist", "data analyst"]
+KEYWORDS = [
+    "data scientist",
+    "data analyst",
+    "statistician",
+    "senior data scientist",
+    "advanced analytics",
+]
 LOCATION = "Toronto, ON"
 RADIUS = 50
 OUTPUT_FILE = "simplyhired_final_cleaned.csv"
+UNIQUE_JOBS_FILE = "unique_jobs_shortlist.csv"
 MAX_JOBS_TO_SCRAPE = 500
 MAX_PAGES_PER_KEYWORD = 18
 
-# Salary reliability controls
-SALARY_RETRIES = 3
-SALARY_WAIT_SECONDS = 8
-OPEN_URL_FALLBACK = True
+# Minimum acceptable total annual compensation, in CAD. Postings are kept when
+# the TOP of their advertised range reaches this figure.
+SALARY_TARGET_CAD = 118_000
+
+# Drop postings that publish a salary below the target. Postings that publish
+# NO salary are never dropped by this: most employers omit compensation, so
+# treating a missing figure as a failure would hide the majority of real leads.
+# Set to False to keep below-target postings in the shortlist too.
+EXCLUDE_BELOW_TARGET = True
+
+# Values of the salary_status column in the exported shortlist.
+SALARY_STATUS_MEETS = "meets_target"
+SALARY_STATUS_UNKNOWN = "not_posted"
+SALARY_STATUS_BELOW = "below_target"
 
 # --- ADVANCED KEYWORD LOGIC ---
+# Only genuinely off-target roles belong here. Seniority words (manager, lead,
+# principal, director) are deliberately NOT vetoed: senior individual-contributor
+# and player-coach data roles are the ones that clear the salary target, and
+# vetoing them threw away the best-paying matches. A senior title with no data
+# signal still gets dropped, because it matches neither list below.
 BAD_KEYWORDS = [
-    "intern", "co-op", "coop", "student", "summer", "placement",
-    "manager", "director", "head of", "vp", "president", "chief", "principal", "lead",
+    "intern", "co-op", "coop", "student", "summer", "placement", "junior",
     "sales", "customer service", "technician", "support", "clerk", "admin",
-    "marketing", "account executive", "driver", "warehouse", "nurse", "bilingual",
-    "business analyst", "business systems analyst", "business system analyst", "financial analyst"
+    "marketing", "account executive", "driver", "warehouse", "nurse",
+    "receptionist", "cashier", "server", "cook", "security guard",
 ]
 
 STRONG_KEYWORDS = [
-    "data scientist", "data engineer", "machine learning", "ai engineer", "analytics",
-    "computer vision", "nlp", "business intelligence", "deep learning",
-    "data analyst", "quantitative researcher", "statistical modeling", "statistician"
+    "data scientist", "data science", "data engineer", "machine learning",
+    "ai engineer", "analytics", "computer vision", "nlp", "business intelligence",
+    "deep learning", "data analyst", "quantitative researcher", "quantitative analyst",
+    "statistical modeling", "statistical modelling", "statistician", "biostatistician",
+    "statistics", "statistical", "econometric", "decision scientist", "decision science",
+    "applied scientist", "research scientist", "risk modeling", "risk modelling",
 ]
 
 AMBIGUOUS_KEYWORDS = [
     "analyst", "insights", "consultant", "scientist", "researcher",
-    "strategist", "specialist", "associate"
+    "strategist", "specialist", "associate",
+    # Seniority words: kept only when the description proves a technical role.
+    "manager", "lead", "principal", "director", "head of",
 ]
 
 TECH_KEYWORDS = [
-    "sql", "python", " r ", "r-programming", "tableau", "power bi", "powerbi",
-    "aws", "azure", "gcp", "snowflake", "etl", "pipeline", "modeling", "models",
-    "machine learning", "statistical", "looker", "bigquery", "spark", "hadoop"
+    "sql", "python", "r-programming", "tableau", "power bi", "powerbi",
+    "aws", "azure", "gcp", "snowflake", "etl", "pipeline", "modeling", "modelling",
+    "models", "machine learning", "statistical", "statistics", "looker", "bigquery",
+    "spark", "hadoop", "dataiku", "sas", "databricks", "scikit-learn", "pandas",
+    "regression", "forecasting", "experimentation", "a/b test",
 ]
 
-# Output schema (exact column order you want)
-OUTPUT_COLUMNS = ["title", "url", "company", "description", "salary", "qualifications", "scraped_at"]
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-SALARY_RE = re.compile(
-    r"""
-    (?:CA?\$|C\$|\$)\s*[\d]{1,3}(?:[,\s]\d{3})*(?:\.\d+)?\s*[kK]?
-    (?:\s*(?:-|–|—|to)\s*
-        (?:CA?\$|C\$|\$)?\s*[\d]{1,3}(?:[,\s]\d{3})*(?:\.\d+)?\s*[kK]?
-    )?
-    (?:\s*(?:/|per\s*)?(?:hour|hr|year|yr|month|mo|week|wk|day|annum))?
-    """,
-    re.IGNORECASE | re.VERBOSE
-)
+# Output schema. The scraped description is preserved verbatim; the optional
+# summariser writes to description_summary so salary text is never destroyed.
+OUTPUT_COLUMNS = [
+    "title", "url", "company", "description", "description_summary", "salary",
+    "salary_min_annual", "salary_max_annual", "salary_period",
+    "meets_salary_target", "fit_score", "matched_skills",
+    "qualifications", "scraped_at",
+]
 
 # --- STRICT FIELD VALIDATION ---
 REQUIRE_COMPANY = True          # hard stop for saving/buffering
@@ -99,31 +122,12 @@ def is_missing(s):
 
 
 def fix_doubled_title(text):
-    """
-    Fixes titles that are repeated like 'Data Scientist Data Scientist'
-    or 'Sr. Statistician Sr. Statistician'.
-    """
-    if not text:
-        return ""
-    
-    # Normalize spaces
-    text = " ".join(text.split())
-    
-    # 1. Check for word-based duplication (e.g. "Data Scientist Data Scientist")
-    parts = text.split()
-    if len(parts) >= 2 and len(parts) % 2 == 0:
-        half = len(parts) // 2
-        # If the first half of words equals the second half
-        if parts[:half] == parts[half:]:
-            return " ".join(parts[:half])
+    """Fix titles scraped twice, e.g. 'Data Scientist Data Scientist'.
 
-    # 2. Check for concatenated duplication (e.g. "Data ScientistData Scientist")
-    if len(text) > 4 and len(text) % 2 == 0:
-        mid = len(text) // 2
-        if text[:mid] == text[mid:]:
-            return text[:mid]
-            
-    return text
+    Kept as the name used throughout the scrapers; the implementation lives in
+    sanitize_title so the scraper and the CSV cleaner cannot drift apart.
+    """
+    return sanitize_title(text)
 
 
 def dbg(status, title=None, company=None, salary=None, url=None, reason=None):
@@ -138,6 +142,11 @@ def dbg(status, title=None, company=None, salary=None, url=None, reason=None):
 
 
 def make_driver():
+    if not SELENIUM_AVAILABLE:
+        raise RuntimeError(
+            "Selenium and webdriver-manager are required for scraping. "
+            f"Install them with `pip install -r requirements.txt` ({SELENIUM_IMPORT_ERROR})."
+        )
     opts = Options()
     opts.add_argument("--window-size=1600,1000")
     opts.add_argument("--disable-blink-features=AutomationControlled")
@@ -153,11 +162,72 @@ def make_driver():
 
 
 def clean_salary_text(text: str) -> str:
+    """Return the compensation snippet from a blob of text, or "N/A".
+
+    Delegates to the validated parser so that unrelated dollar amounts
+    ("$500 million in assets", "$2,000 wellness spend") are not mistaken for pay.
+    """
     if not text:
         return "N/A"
-    t = " ".join(text.split())
-    m = SALARY_RE.search(t)
-    return m.group(0).strip() if m else "N/A"
+    parsed = best_salary(text)
+    return parsed.raw if parsed.found else "N/A"
+
+
+# ----------------------------
+# URL / signature helpers (shared by the scraper and the CSV cleaner)
+# ----------------------------
+def canonical_url(url) -> str:
+    """Normalise a job URL so the same posting compares equal.
+
+    Strips query strings, fragments and trailing slashes, lowercases the host,
+    and maps placeholders to the empty string. Returning "" for a missing URL
+    matters: empty URLs must never be treated as equal to one another.
+    """
+    if url is None:
+        return ""
+    text = str(url).strip()
+    if not text or text.lower() in {"n/a", "na", "none", "null", "nan"}:
+        return ""
+    if not text.lower().startswith("http"):
+        return ""
+    parts = urlsplit(text)
+    path = parts.path.rstrip("/")
+    return f"{parts.scheme.lower()}://{parts.netloc.lower()}{path}"
+
+
+def job_signature(title, company) -> str:
+    """A punctuation- and case-insensitive identity for a posting."""
+    t = re.sub(r"[^a-z0-9]", "", str(title or "").lower())
+    c = re.sub(r"[^a-z0-9]", "", str(company or "").lower())
+    return f"{c}_{t}"
+
+
+def sanitize_title(text) -> str:
+    """Strip listing noise and collapse titles that were scraped twice."""
+    if not text:
+        return ""
+
+    clean = str(text)
+    noise_phrases = ["with verification", " - Job", "(f/m/d)", "(m/f/d)"]
+    for phrase in noise_phrases:
+        clean = re.compile(re.escape(phrase), re.IGNORECASE).sub("", clean)
+
+    clean = " ".join(clean.split())
+
+    # "Data Scientist Data Scientist" -> "Data Scientist"
+    words = clean.split()
+    if len(words) >= 2 and len(words) % 2 == 0:
+        mid = len(words) // 2
+        if [w.lower() for w in words[:mid]] == [w.lower() for w in words[mid:]]:
+            return " ".join(words[:mid])
+
+    # "Data ScientistData Scientist" -> "Data Scientist"
+    if len(clean) > 6 and len(clean) % 2 == 0:
+        mid = len(clean) // 2
+        if clean[:mid].lower() == clean[mid:].lower():
+            return clean[:mid]
+
+    return clean
 
 
 # ----------------------------
@@ -211,7 +281,6 @@ def parse_job_data(driver, card, prev_desc):
         return None
 
     # --- SYNCHRONIZATION: Wait for Pane to Match Card ---
-    wait = WebDriverWait(driver, 10)
     pane_matched = False
     
     # Selectors to find company/title in the Right Pane
@@ -274,17 +343,20 @@ def parse_job_data(driver, card, prev_desc):
 
     data["description"] = desc_text
 
-    # Salary
-    salary = "N/A"
+    # Salary: prefer the dedicated compensation box, then fall back to the
+    # description. The old fallback scanned the whole job pane for any "$",
+    # which routinely captured revenue figures and perk amounts as pay.
+    salary_box_text = ""
     try:
-        sal_box = driver.find_element(By.CSS_SELECTOR, '[data-testid="viewJobBodyJobCompensation"]')
-        salary = clean_salary_text(sal_box.text)
+        salary_box_text = driver.find_element(
+            By.CSS_SELECTOR, '[data-testid="viewJobBodyJobCompensation"]'
+        ).text
     except Exception:
-        try:
-            salary = clean_salary_text(driver.find_element(By.CSS_SELECTOR, '[data-testid="viewJobBodyContainer"]').text)
-        except Exception:
-            salary = "N/A"
-    data["salary"] = salary
+        salary_box_text = ""
+
+    data["salary"] = clean_salary_text(salary_box_text) if salary_box_text else "N/A"
+    if is_missing(data["salary"]):
+        data["salary"] = clean_salary_text(desc_text)
 
     if REQUIRE_SALARY and is_missing(data["salary"]):
         dbg("SKIP_SH", title=data["title"], company=data["company"], salary=data["salary"], url=data["url"],
@@ -299,8 +371,39 @@ def parse_job_data(driver, card, prev_desc):
         data["qualifications"] = "N/A"
 
     data["scraped_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    annotate_job(data)
 
     dbg("SCRAPED_OK_SH", title=data["title"], company=data["company"], salary=data["salary"], url=data["url"])
+    return data
+
+
+def annotate_job(data: dict) -> dict:
+    """Attach normalised salary and profile-fit columns to a scraped row.
+
+    Salary is read from the salary field, the description and the
+    qualifications, because most boards (LinkedIn in particular) never populate
+    a structured compensation field.
+    """
+    parsed = best_salary(
+        data.get("salary", ""),
+        data.get("description", ""),
+        data.get("qualifications", ""),
+    )
+    data["salary_min_annual"] = parsed.min_annual if parsed.found else ""
+    data["salary_max_annual"] = parsed.max_annual if parsed.found else ""
+    data["salary_period"] = parsed.period or ""
+    data["meets_salary_target"] = parsed.meets(SALARY_TARGET_CAD)
+    if is_missing(data.get("salary")) and parsed.found:
+        data["salary"] = parsed.raw
+
+    score, matched = score_profile_fit(
+        data.get("title", ""),
+        data.get("description", ""),
+        data.get("qualifications", ""),
+    )
+    data["fit_score"] = score
+    data["matched_skills"] = matched
+    data.setdefault("description_summary", "")
     return data
 
 
@@ -317,6 +420,11 @@ def summarize_new_jobs_buffer(new_jobs_list):
     except ImportError:
         print("Transformers not installed. Skipping summarization.")
         return pd.DataFrame(new_jobs_list)
+
+    try:
+        import torch
+    except ImportError:
+        torch = None
 
     device = "cuda" if torch and torch.cuda.is_available() else "cpu"
     print(f"Running on device: {device.upper()}")
@@ -347,7 +455,10 @@ def summarize_new_jobs_buffer(new_jobs_list):
         except Exception:
             return text
 
-    df["description"] = df["description"].apply(process_text)
+    # Write to a separate column: the raw description is the only place a
+    # LinkedIn salary appears, and overwriting it with a summary destroyed both
+    # the compensation text and the skill keywords used for filtering.
+    df["description_summary"] = df["description"].apply(process_text)
     df["salary"] = df["salary"].replace(r"^\s*$", "N/A", regex=True).fillna("N/A")
     return df
 
@@ -385,6 +496,30 @@ def linkedin_url_from_card(card) -> str:
         return href.split("?")[0] if href else ""
     except Exception:
         return ""
+
+
+def linkedin_salary_from_pane(driver) -> str:
+    """Read the compensation element from the LinkedIn detail pane.
+
+    Returns "" when absent, in which case the caller falls back to parsing the
+    description. Ontario postings are required to state a range, so the number
+    is usually in the description even when the structured field is empty.
+    """
+    sels = [
+        ".jobs-unified-top-card__salary-details",
+        ".job-details-jobs-unified-top-card__job-insight span",
+        ".compensation__salary",
+        "[class*='salary']",
+    ]
+    for sel in sels:
+        try:
+            for el in driver.find_elements(By.CSS_SELECTOR, sel):
+                txt = (el.text or "").strip()
+                if txt and "$" in txt:
+                    return txt
+        except Exception:
+            continue
+    return ""
 
 
 def linkedin_company_from_pane(driver) -> str:
@@ -432,7 +567,7 @@ def scrape_linkedin_authenticated(driver, seen_signatures, seen_urls, new_jobs_b
                 return
 
             if current_page_num > MAX_PAGES_PER_KEYWORD:
-                print(f"   [PAGE LIMIT REACHED] Stopping LinkedIn scan for this keyword.")
+                print("   [PAGE LIMIT REACHED] Stopping LinkedIn scan for this keyword.")
                 break
 
             print(f"   Processing Page {current_page_num}...")
@@ -488,7 +623,7 @@ def scrape_linkedin_authenticated(driver, seen_signatures, seen_urls, new_jobs_b
                         continue
 
                     # Duplicate URL check
-                    if job_url and job_url in seen_urls:
+                    if canonical_url(job_url) and canonical_url(job_url) in seen_urls:
                         if DEBUG_EVERY_SKIP:
                             dbg("LI_SKIP_DUP_URL", title=raw_title, url=job_url, reason="url already seen")
                         continue
@@ -508,7 +643,6 @@ def scrape_linkedin_authenticated(driver, seen_signatures, seen_urls, new_jobs_b
                         continue
 
                     # --- SYNCHRONIZATION: Wait for Pane Title to Match Card Title ---
-                    wait = WebDriverWait(driver, 10)
                     pane_matched = False
                     
                     # Try to find the title in the detail pane
@@ -611,20 +745,25 @@ def scrape_linkedin_authenticated(driver, seen_signatures, seen_urls, new_jobs_b
                                     reason="ambiguous, no tech keywords")
 
                     if should_save:
+                        # LinkedIn shows compensation in a dedicated element on
+                        # some postings and inline in the description on others.
+                        salary_text = linkedin_salary_from_pane(driver)
                         data = {
                             "title": raw_title,
                             "url": job_url or "N/A",
                             "company": raw_company,
                             "description": description,
-                            "salary": "N/A",
+                            "salary": clean_salary_text(salary_text) if salary_text else "N/A",
                             "qualifications": "N/A",
                             "scraped_at": time.strftime("%Y-%m-%d %H:%M:%S")
                         }
+                        annotate_job(data)
                         new_jobs_buffer.append(data)
                         if job_url:
-                            seen_urls.add(job_url)
+                            seen_urls.add(canonical_url(job_url))
                         seen_signatures.add(sig)
-                        dbg("LI_BUFFERED", title=raw_title, company=raw_company, url=job_url)
+                        dbg("LI_BUFFERED", title=raw_title, company=raw_company,
+                            salary=data["salary"], url=job_url)
 
                     time.sleep(random.uniform(0.4, 1.2))
 
@@ -734,7 +873,7 @@ def verify_and_clean_data():
     df_clean = df[df["is_valid"] == True].drop(columns=["is_valid"])
     removed_count = original_count - len(df_clean)
 
-    print(f"\nFinished Checking.")
+    print("\nFinished Checking.")
     print(f"   Original: {original_count}")
     print(f"   Valid:    {len(df_clean)}")
     print(f"   Removed:  {removed_count}")
@@ -760,7 +899,12 @@ def run_scraper():
         try:
             old_df = pd.read_csv(OUTPUT_FILE)
             if "url" in old_df.columns:
-                seen_urls = set(old_df["url"].dropna().tolist())
+                # Canonicalise, and drop blanks: an empty url is not an identity,
+                # so keeping "" in this set would suppress every url-less posting.
+                seen_urls = {
+                    canonical_url(u) for u in old_df["url"].dropna().tolist()
+                }
+                seen_urls.discard("")
             if "title" in old_df.columns and "company" in old_df.columns:
                 for _, row in old_df.iterrows():
                     t = str(row.get('title', '')).lower().strip()
@@ -817,7 +961,7 @@ def run_scraper():
                             temp_company_tag = temp_soup.find("span", attrs={"data-testid": "companyName"})
                             raw_company_dbg = temp_company_tag.get_text(strip=True) if temp_company_tag else ""
 
-                            if check_url and check_url in seen_urls:
+                            if canonical_url(check_url) and canonical_url(check_url) in seen_urls:
                                 if DEBUG_EVERY_SKIP:
                                     dbg("SKIP_DUP_URL_CARD", title=raw_title_dbg, company=raw_company_dbg,
                                         url=check_url, reason="already seen")
@@ -859,7 +1003,7 @@ def run_scraper():
                         if not job_data:
                             continue
 
-                        if job_data["url"] in seen_urls:
+                        if canonical_url(job_data["url"]) and canonical_url(job_data["url"]) in seen_urls:
                             if DEBUG_EVERY_SKIP:
                                 dbg("SKIP_DUP_URL_SH", title=job_data["title"], company=job_data["company"], url=job_data["url"])
                             continue
@@ -891,7 +1035,7 @@ def run_scraper():
 
                         if should_save:
                             new_jobs_buffer.append(job_data)
-                            seen_urls.add(job_data["url"])
+                            seen_urls.add(canonical_url(job_data["url"]))
                             seen_signatures.add(sig)
                             total_saved_this_run += 1
                             dbg("BUFFERED_SH", title=job_data["title"], company=job_data["company"],
@@ -912,6 +1056,13 @@ def run_scraper():
                     time.sleep(3)
                 except Exception:
                     break
+
+            # MAX_JOBS_TO_SCRAPE is a run-wide cap. Without this the inner
+            # breaks only ended the current keyword, and the next keyword
+            # started scraping again past the limit.
+            if total_saved_this_run >= MAX_JOBS_TO_SCRAPE:
+                print("   [MAX JOBS LIMIT REACHED] Stopping SimplyHired scan.")
+                break
 
         # --- 2. PAUSE FOR LOGIN ---
         print("\n" + "=" * 50)
@@ -943,137 +1094,210 @@ def run_scraper():
             print(f"Success: Appended {len(df_final_new)} jobs to {OUTPUT_FILE}.")
         else:
             print("\nScraping complete. No new jobs found.")
+def dedupe_jobs(df: pd.DataFrame) -> pd.DataFrame:
+    """Collapse duplicate postings, keeping every genuinely distinct job.
 
-def remove_csv_duplicates():
-    if not os.path.exists(OUTPUT_FILE):
-        print(f"File {OUTPUT_FILE} not found.")
-        return
+    The previous implementation ran drop_duplicates on the raw url column. Rows
+    scraped without a url carry the literal string "N/A", so every url-less
+    posting compared equal and all but one were deleted -- silently discarding
+    real jobs. Here, blank urls are excluded from url-based matching entirely
+    and identity falls back to the company+title signature.
+    """
+    if df.empty:
+        return df
 
-    print(f"\n=== CLEANING TITLES & REMOVING DUPLICATES ===")
-    df = pd.read_csv(OUTPUT_FILE)
-    original_count = len(df)
-
-    # Ensure columns exist and fill NaNs
-    for col in ["title", "company", "url"]:
+    df = df.copy()
+    for col in ("title", "company", "url"):
         if col not in df.columns:
             df[col] = ""
         df[col] = df[col].fillna("").astype(str)
 
-    # ---------------------------------------------------------
-    # 1. DEFINE AGGRESSIVE CLEANING LOGIC
-    # ---------------------------------------------------------
-    def sanitize_title(text):
-        if not text: return ""
-        
-        # A. Remove "with verification" and other noise (Case Insensitive)
-        clean = text
-        noise_phrases = [
-            "with verification", 
-            " - Job", 
-            "(f/m/d)", 
-            "(m/f/d)"
-        ]
-        for phrase in noise_phrases:
-            pattern = re.compile(re.escape(phrase), re.IGNORECASE)
-            clean = pattern.sub("", clean)
-
-        # B. Normalize whitespace
-        clean = " ".join(clean.split())
-
-        # C. Fix "Doubled" Titles (e.g. "Data Scientist Data Scientist")
-        # Logic: Split into words. If the first half equals the second half, cut it.
-        words = clean.split()
-        if len(words) >= 2 and len(words) % 2 == 0:
-            mid = len(words) // 2
-            first_half = words[:mid]
-            second_half = words[mid:]
-            
-            # Case-insensitive comparison of the two halves
-            if [w.lower() for w in first_half] == [w.lower() for w in second_half]:
-                return " ".join(first_half)
-
-        # D. Fix Concatenated Doubling (e.g. "Data ScientistData Scientist")
-        # This checks if the string is exactly repeated without a space in the middle
-        if len(clean) > 6 and len(clean) % 2 == 0:
-            mid = len(clean) // 2
-            s1, s2 = clean[:mid], clean[mid:]
-            if s1.lower() == s2.lower():
-                return s1
-
-        return clean
-
-    # ---------------------------------------------------------
-    # 2. APPLY CLEANING TO THE DATAFRAME
-    # ---------------------------------------------------------
-    print("   Sanitizing titles (removing 'with verification' and doubled words)...")
-    # This actually UPDATES the 'title' column in the dataframe
     df["title"] = df["title"].apply(sanitize_title)
+    df["_sig"] = [job_signature(t, c) for t, c in zip(df["title"], df["company"])]
+    df["_canon_url"] = df["url"].apply(canonical_url)
 
-    # ---------------------------------------------------------
-    # 3. DEDUPLICATE BASED ON CLEANED DATA
-    # ---------------------------------------------------------
-    print("   Checking for duplicates...")
+    # Prefer rows that have a url, then the shortest url, then the newest scrape.
+    df["_has_url"] = (df["_canon_url"] != "").astype(int)
+    df["_url_len"] = df["_canon_url"].str.len()
 
-    # Create a normalized signature for comparison (Company + Title)
-    # We strip non-alphanumeric chars to ensure "Intact." == "Intact"
-    def make_signature(row):
-        t = re.sub(r'[^a-z0-9]', '', row["title"].lower())
-        c = re.sub(r'[^a-z0-9]', '', row["company"].lower())
-        return f"{c}_{t}"
-
-    df["_sig"] = df.apply(make_signature, axis=1)
-
-    # Sort so that if we have duplicates, we prioritize:
-    # 1. The one with a URL (if one is missing)
-    # 2. The one with the shorter URL (usually SimplyHired or cleaner links)
-    # 3. Scraped most recently
-    df["_url_len"] = df["url"].apply(len)
-    
-    sort_cols = ["_sig", "_url_len"]
+    sort_cols = ["_sig", "_has_url", "_url_len"]
+    ascending = [True, False, True]
     if "scraped_at" in df.columns:
         sort_cols.append("scraped_at")
-        ascending_order = [True, True, False] # Sig asc, URL len asc, Date desc
-    else:
-        ascending_order = [True, True]
+        ascending.append(False)
+    df = df.sort_values(by=sort_cols, ascending=ascending, kind="mergesort")
 
-    df = df.sort_values(by=sort_cols, ascending=ascending_order)
+    # 1. One row per company+title.
+    out = df.drop_duplicates(subset=["_sig"], keep="first")
 
-    # Drop duplicates based on the signature (Company + Title)
-    df_clean = df.drop_duplicates(subset=["_sig"], keep="first")
-    
-    # Also drop duplicates on URL just in case
-    df_clean = df_clean.drop_duplicates(subset=["url"], keep="first")
+    # 2. One row per url, but only among rows that actually have a url.
+    with_url = out[out["_canon_url"] != ""].drop_duplicates(
+        subset=["_canon_url"], keep="first"
+    )
+    without_url = out[out["_canon_url"] == ""]
+    out = pd.concat([with_url, without_url])
 
-    # Clean up temp columns
-    df_clean = df_clean.drop(columns=["_sig", "_url_len"])
+    if "scraped_at" in out.columns:
+        out = out.sort_values(by="scraped_at", ascending=False, kind="mergesort")
 
-    # ---------------------------------------------------------
-    # 4. SAVE
-    # ---------------------------------------------------------
+    return out.drop(columns=["_sig", "_canon_url", "_has_url", "_url_len"]).reset_index(
+        drop=True
+    )
+
+
+def enrich_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """(Re)compute salary and profile-fit columns for every row.
+
+    Safe to run on CSVs produced before these columns existed.
+    """
+    if df.empty:
+        return df
+
+    df = df.copy()
+    for col in ("salary", "description", "qualifications", "title"):
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str)
+
+    records = []
+    for _, row in df.iterrows():
+        parsed = best_salary(row["salary"], row["description"], row["qualifications"])
+        score, matched = score_profile_fit(
+            row["title"], row["description"], row["qualifications"]
+        )
+        records.append(
+            {
+                # Surface the matched snippet when the salary field was empty,
+                # so the CSV shows where the figure came from.
+                "salary": parsed.raw if (parsed.found and is_missing(row["salary"]))
+                else row["salary"],
+                "salary_min_annual": parsed.min_annual if parsed.found else "",
+                "salary_max_annual": parsed.max_annual if parsed.found else "",
+                "salary_period": parsed.period or "",
+                "meets_salary_target": parsed.meets(SALARY_TARGET_CAD),
+                "fit_score": score,
+                "matched_skills": matched,
+            }
+        )
+
+    for col, values in pd.DataFrame(records).items():
+        df[col] = values.values
+    return df
+
+
+def export_unique_jobs(target: float = SALARY_TARGET_CAD):
+    """Produce the final shortlist of unique postings.
+
+    Most employers never publish a salary, so "no salary listed" is treated as
+    unknown, not as a failure to meet the target. Those postings stay in the
+    shortlist and are ranked by profile fit. Only postings that publish a
+    salary AND fall below the target are dropped, and only when
+    EXCLUDE_BELOW_TARGET is on.
+
+    Every row carries a salary_status column so the file can be re-sorted or
+    re-filtered in a spreadsheet without rerunning anything.
+    """
+    if not os.path.exists(OUTPUT_FILE):
+        print(f"File {OUTPUT_FILE} not found. Run the scraper (option 1) first.")
+        return
+
+    print(f"\n=== EXPORTING UNIQUE JOBS (target: ${target:,.0f} CAD/year) ===")
+    df = pd.read_csv(OUTPUT_FILE)
+    original_count = len(df)
+
+    df = dedupe_jobs(df)
+    print(f"   {original_count} rows -> {len(df)} unique postings")
+
+    df = enrich_dataframe(df)
+
+    has_salary = df["salary_max_annual"].astype(str).str.strip() != ""
+    meets = df["meets_salary_target"].astype(bool)
+
+    df["salary_status"] = SALARY_STATUS_UNKNOWN
+    df.loc[has_salary & meets, "salary_status"] = SALARY_STATUS_MEETS
+    df.loc[has_salary & ~meets, "salary_status"] = SALARY_STATUS_BELOW
+
+    df.to_csv(OUTPUT_FILE, index=False, encoding="utf-8")
+
+    shortlist = df if not EXCLUDE_BELOW_TARGET else df[df["salary_status"] != SALARY_STATUS_BELOW]
+    shortlist = shortlist.copy()
+
+    # Confirmed matches first, then unpublished salaries, each ranked by how
+    # well the posting fits the profile.
+    shortlist["_rank"] = shortlist["salary_status"].map(
+        {SALARY_STATUS_MEETS: 0, SALARY_STATUS_UNKNOWN: 1, SALARY_STATUS_BELOW: 2}
+    ).fillna(3)
+    sort_cols = ["_rank"] + [
+        c for c in ("fit_score", "salary_max_annual") if c in shortlist.columns
+    ]
+    shortlist = shortlist.sort_values(
+        by=sort_cols, ascending=[True] + [False] * (len(sort_cols) - 1)
+    ).drop(columns=["_rank"])
+
+    shortlist.to_csv(UNIQUE_JOBS_FILE, index=False, encoding="utf-8")
+
+    counts = df["salary_status"].value_counts()
+    n_meets = int(counts.get(SALARY_STATUS_MEETS, 0))
+    n_unknown = int(counts.get(SALARY_STATUS_UNKNOWN, 0))
+    n_below = int(counts.get(SALARY_STATUS_BELOW, 0))
+
+    print(f"   Salary >= target  : {n_meets:>4}  (in shortlist)")
+    print(f"   Salary not posted : {n_unknown:>4}  (in shortlist, ranked by fit)")
+    verb = "excluded" if EXCLUDE_BELOW_TARGET else "in shortlist"
+    print(f"   Salary below tgt  : {n_below:>4}  ({verb})")
+    print(f"\n   {len(shortlist)} jobs -> {UNIQUE_JOBS_FILE}")
+
+    if not shortlist.empty:
+        cols = [
+            c for c in ("title", "company", "salary", "salary_status", "fit_score")
+            if c in shortlist.columns
+        ]
+        print("\n   [Top of shortlist]")
+        print(shortlist[cols].head(10).to_string(index=False))
+
+
+def remove_csv_duplicates():
+    """Clean titles and remove duplicate postings from the main CSV."""
+    if not os.path.exists(OUTPUT_FILE):
+        print(f"File {OUTPUT_FILE} not found.")
+        return
+
+    print("\n=== CLEANING TITLES & REMOVING DUPLICATES ===")
+    df = pd.read_csv(OUTPUT_FILE)
+    original_count = len(df)
+
+    df_clean = dedupe_jobs(df)
     removed_count = original_count - len(df_clean)
-    df_clean.to_csv(OUTPUT_FILE, index=False)
-    
-    print(f"   Done.")
+    df_clean.to_csv(OUTPUT_FILE, index=False, encoding="utf-8")
+
+    print("   Done.")
     print(f"   Original rows: {original_count}")
     print(f"   Cleaned rows:  {len(df_clean)}")
     print(f"   Removed:       {removed_count} duplicates.")
-    
-    # Verification output
-    print("\n   [Sample of cleaned titles]:")
-    print(df_clean[["title", "company"]].head(5).to_string(index=False))
+
+    if not df_clean.empty:
+        print("\n   [Sample of cleaned titles]:")
+        print(df_clean[["title", "company"]].head(5).to_string(index=False))
+
 
 if __name__ == "__main__":
     print("What would you like to do?")
-    print("1. SCRAPE New Jobs (SimplyHired + LinkedIn)")
-    print("2. VERIFY and CLEAN existing URLs in CSV")
-    print("3. REMOVE Duplicates from CSV (by URL)")
-    choice = input("Enter 1, 2, or 3: ").strip()
+    print("1. SCRAPE new jobs (SimplyHired + LinkedIn)")
+    print("2. VERIFY existing URLs are still live")
+    print("3. REMOVE duplicates from the CSV")
+    print(f"4. EXPORT unique jobs paying ${SALARY_TARGET_CAD:,} CAD or more")
+    choice = input("Enter 1, 2, 3 or 4: ").strip()
 
     if choice == "1":
         run_scraper()
+        # A scrape is only useful once duplicates are gone and the shortlist
+        # is rebuilt, so chain the export instead of making it a separate step.
+        export_unique_jobs()
     elif choice == "2":
         verify_and_clean_data()
     elif choice == "3":
         remove_csv_duplicates()
+    elif choice == "4":
+        export_unique_jobs()
     else:
         print("Invalid choice. Exiting.")
