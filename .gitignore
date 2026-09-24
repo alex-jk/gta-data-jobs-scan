@@ -16,3 +16,9 @@ simplyhired_final_cleaned.csv
 simplyhired_final_cleaned_backup.csv
 # generated shortlists
 unique_jobs_shortlist.csv
+*.csv.bak
+sample_summaries.json
+linkedin_debug_*.html
+linkedin_debug_*.png
+linkedin_diag_*.html
+linkedin_diag_*.png
