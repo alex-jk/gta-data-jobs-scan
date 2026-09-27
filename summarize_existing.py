@@ -6,6 +6,7 @@ import pandas as pd
 CSV = "simplyhired_final_cleaned.csv"
 OUT_CSV = "simplyhired_final_cleaned_with_summaries.csv"
 SHORTLIST = "unique_jobs_shortlist.csv"
+RAW_RESULTS_CHECKPOINT = "summary_results_raw.csv"
 
 if not os.path.exists(CSV):
     print(f"Source CSV not found: {CSV}")
@@ -19,6 +20,16 @@ df = pd.read_csv(CSV)
 # Ensure a column for summaries
 if "description_summary" not in df.columns:
     df["description_summary"] = pd.NA
+
+# A column that is all-NaN in the source CSV gets typed as float64 by pandas.
+# Writing a real summary STRING into a float64 cell later raises a hard
+# TypeError in this pandas version (used to silently upcast) -- which used to
+# crash the merge-back step AFTER every summary had already been generated,
+# throwing away a full paid run of real API calls. Force both columns to a
+# dtype that can actually hold strings before that ever happens.
+df["description_summary"] = df["description_summary"].astype(object)
+if "salary" in df.columns:
+    df["salary"] = df["salary"].astype(object)
 
 # Select rows missing a summary
 mask = df["description_summary"].isna() | (df["description_summary"].astype(str).str.strip() == "")
@@ -39,17 +50,33 @@ rows = rows_to_summarize.to_dict(orient="records")
 
 result_df = summarize_new_jobs_buffer(rows)
 
+# The API calls above are the expensive/paid part. Dump the raw results to
+# disk immediately, before any merge-back logic runs, so a bug in the merge
+# (or anything else past this point) can never destroy a completed batch of
+# real summaries again -- this file is the recovery point.
+result_df.to_csv(RAW_RESULTS_CHECKPOINT, index=False)
+print(f"Checkpointed {len(result_df)} raw summary results to {RAW_RESULTS_CHECKPOINT}")
+
 # result_df corresponds to rows in the same order; merge back using a temporary index column
 result_df = result_df.reset_index(drop=True)
 rows_to_summarize = rows_to_summarize.reset_index()
 
-# Map summaries and salary back into original df by matching on row order
+# Map summaries and salary back into original df by matching on row order.
+# One bad row must not discard every other row's already-completed summary.
+merge_failures = 0
 for i, r in result_df.iterrows():
     orig_index = rows_to_summarize.at[i, 'index']
-    if 'description_summary' in r:
-        df.at[orig_index, 'description_summary'] = r.get('description_summary')
-    if 'salary' in r:
-        df.at[orig_index, 'salary'] = r.get('salary', df.at[orig_index, 'salary'])
+    try:
+        if 'description_summary' in r:
+            df.at[orig_index, 'description_summary'] = r.get('description_summary')
+        if 'salary' in r:
+            df.at[orig_index, 'salary'] = r.get('salary', df.at[orig_index, 'salary'])
+    except Exception as exc:
+        merge_failures += 1
+        print(f"[WARN] Failed to merge row {i} (orig_index={orig_index}): {type(exc).__name__}: {exc}")
+
+if merge_failures:
+    print(f"[WARN] {merge_failures} row(s) failed to merge -- see {RAW_RESULTS_CHECKPOINT} to recover them manually.")
 
 # Save updated CSV (backup original)
 backup = CSV + ".bak"

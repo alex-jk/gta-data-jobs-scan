@@ -22,3 +22,7 @@ linkedin_debug_*.html
 linkedin_debug_*.png
 linkedin_diag_*.html
 linkedin_diag_*.png
+.linkedin_profile/
+simplyhired_final_cleaned_with_summaries.csv
+summary_results_raw.csv
+run_full_scrape.py

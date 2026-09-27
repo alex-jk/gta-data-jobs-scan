@@ -426,16 +426,23 @@ def summarize_new_jobs_buffer(new_jobs_list):
     # otherwise fall back to local transformers if installed. This keeps costs controllable
     # and allows switching without code edits.
     use_openai = bool(os.environ.get("USE_OPENAI_SUMMARIZER", "1").strip() in {"1", "true", "True"})
-    openai = None
+    openai_client = None
     if use_openai:
         try:
-            import openai
-            openai.api_key = os.environ.get("OPENAI_API_KEY")
-            if not openai.api_key:
+            # openai>=1.0 removed the old openai.ChatCompletion.create()
+            # global-style call entirely (raises APIRemovedInV1) in favour of
+            # an OpenAI() client instance -- calling the old interface used
+            # to fail silently here and return the raw, unsummarized text for
+            # every single row.
+            from openai import OpenAI
+            api_key = os.environ.get("OPENAI_API_KEY")
+            if not api_key:
                 print("OPENAI_API_KEY not set — falling back to local transformers (if available)")
                 use_openai = False
-        except Exception:
-            print("OpenAI package not available — falling back to local transformers")
+            else:
+                openai_client = OpenAI(api_key=api_key)
+        except Exception as exc:
+            print(f"OpenAI package not available ({exc}) — falling back to local transformers")
             use_openai = False
 
     # If not using OpenAI, try transformers (smaller model by default to reduce resource use)
@@ -462,20 +469,32 @@ def summarize_new_jobs_buffer(new_jobs_list):
     start_time = time.time()
     processed = 0
 
+    _openai_error_shown = False
+
     def summarize_with_openai(text, model_name="gpt-3.5-turbo"):
+        nonlocal _openai_error_shown
+        if not text or text == "N/A":
+            return text
         prompt = (
             "Summarize technical skills and duties in this job text, and extract salary or salary range if present. "
             "Return a single concise paragraph. If no salary is present, return 'N/A' for salary.\n\n" + text
         )
         try:
-            resp = openai.ChatCompletion.create(
+            resp = openai_client.chat.completions.create(
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
                 max_tokens=256,
             )
             return resp.choices[0].message.content.strip()
-        except Exception:
+        except Exception as exc:
+            # Surface the failure once instead of silently returning the raw
+            # text for every row -- a systemic failure (bad key, removed API,
+            # rate limit) used to look identical to a successful no-op run.
+            if not _openai_error_shown:
+                print(f"[WARN] OpenAI summarization call failed ({type(exc).__name__}: {exc}); "
+                      f"returning raw description for this and any other failing rows.")
+                _openai_error_shown = True
             return text
 
     def summarize_with_hf(text):
@@ -499,13 +518,22 @@ def summarize_new_jobs_buffer(new_jobs_list):
         except Exception:
             return text
 
+    def _safe_str(v):
+        # DataFrame.to_dict() turns empty/NaN cells into a float NaN, not "";
+        # .get(key, default) only falls back on a MISSING key, so a present-
+        # but-NaN "description" or "title" reaches here as a float and blows
+        # up string concatenation downstream.
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return ""
+        return str(v)
+
     for i, job in enumerate(new_jobs_list, start=1):
         t0 = time.time()
-        title = job.get("title", "")
+        title = _safe_str(job.get("title", ""))
         short_title = (title[:60] + "...") if len(title) > 60 else title
         processed += 1
         # Summarize using chosen backend
-        text = job.get("description", "")
+        text = _safe_str(job.get("description", ""))
         if use_openai:
             model_choice = os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo")
             summary = summarize_with_openai(text, model_choice)
@@ -513,7 +541,10 @@ def summarize_new_jobs_buffer(new_jobs_list):
             summary = summarize_with_hf(text)
 
         job_out = dict(job)
-        job_out.setdefault("description_summary", summary)
+        # NOT setdefault(): every row read back from the CSV already carries
+        # a "description_summary" key (blank/NaN), so setdefault silently
+        # no-ops and the summary just computed above gets discarded.
+        job_out["description_summary"] = summary
         # Normalize salary to string and handle NaN/None/float
         sal = job_out.get("salary")
         if sal is None or (isinstance(sal, float) and pd.isna(sal)):
@@ -536,91 +567,87 @@ def summarize_new_jobs_buffer(new_jobs_list):
 # ----------------------------
 # LinkedIn helpers (AUTH UI)
 # ----------------------------
-def linkedin_title_from_card_html(card_html: str) -> str:
-    soup = BeautifulSoup(card_html, "lxml")
-    selectors = [
-        "a.job-card-list__title",
-        "a.job-card-container__link",
-        "a.job-card-container__link span[aria-hidden='true']",
-        "h3.base-search-card__title",
-        "h3.job-card-list__title",
-        "h3[class*='job-card']",
-    ]
-    for sel in selectors:
-        node = soup.select_one(sel)
-        if node:
-            txt = node.get_text(" ", strip=True)
-            if txt:
-                return fix_doubled_title(txt)
-    return ""
+# LinkedIn's job-search frontend now emits hashed, per-deploy CSS classes
+# (e.g. "_1274a681", "cf8121e6") in place of the old stable names like
+# "job-card-container" -- every selector built on those old classes matches
+# zero elements now, which is why the scraper stopped finding cards entirely.
+# Two attributes survive the redesign and stay put across deploys:
+#   - componentkey="job-card-component-ref-<jobId>" on each card
+#   - id="JobDetails_AboutTheJob_<jobId>" on the opened description pane
+# Both are keyed by the numeric job id, which also gives us a canonical
+# /jobs/view/<id>/ URL without needing to find an <a href> at all (most cards
+# in the list have no anchor tag -- only the pre-selected one does; the rest
+# are click-handled via JS with no href present).
+_LINKEDIN_EXTRACT_CARDS_JS = """
+const out = [];
+const seen = new Set();
+document.querySelectorAll('[componentkey^="job-card-component-ref-"]').forEach(el => {
+  const ck = el.getAttribute('componentkey');
+  const jobId = ck.split('job-card-component-ref-')[1];
+  if (!jobId || seen.has(jobId)) return;
+  seen.add(jobId);
+  const span = el.querySelector('span[aria-hidden="true"]');
+  let title = '';
+  if (span) {
+    title = Array.from(span.childNodes)
+      .filter(n => n.nodeType === Node.TEXT_NODE)
+      .map(n => n.textContent)
+      .join('')
+      .trim();
+  }
+  const ps = el.querySelectorAll('p');
+  const company = ps.length > 1 ? ps[1].textContent.trim() : '';
+  const location = ps.length > 2 ? ps[2].textContent.trim() : '';
+  out.push({job_id: jobId, title: title, company: company, location: location});
+});
+return out;
+"""
+
+_LINKEDIN_CLICK_CARD_JS = """
+const jobId = arguments[0];
+const el = document.querySelector('[componentkey="job-card-component-ref-' + jobId + '"]');
+if (!el) return false;
+el.scrollIntoView({block: 'center'});
+el.click();
+return true;
+"""
 
 
-def linkedin_url_from_card(card) -> str:
+def linkedin_extract_cards(driver):
+    """Return [{job_id, title, company, location}, ...] for every job card
+    currently rendered in the results list, keyed off componentkey rather
+    than CSS classes (see comment above)."""
     try:
-        a = card.find_element(By.CSS_SELECTOR, "a.job-card-list__title")
-        href = a.get_attribute("href") or ""
-        return href.split("?")[0] if href else ""
+        return driver.execute_script(_LINKEDIN_EXTRACT_CARDS_JS) or []
     except Exception:
-        pass
+        return []
 
+
+def linkedin_click_card(driver, job_id) -> bool:
     try:
-        a = card.find_element(By.CSS_SELECTOR, "a.job-card-container__link")
-        href = a.get_attribute("href") or ""
-        return href.split("?")[0] if href else ""
+        return bool(driver.execute_script(_LINKEDIN_CLICK_CARD_JS, job_id))
     except Exception:
-        # Fallback: try any anchor that looks like a job link
-        try:
-            anchors = card.find_elements(By.TAG_NAME, "a")
-            for a in anchors:
-                href = (a.get_attribute("href") or "")
-                if href and ("/jobs/view" in href or "/jobs/" in href):
-                    return href.split("?")[0]
-        except Exception:
-            pass
-        return ""
+        return False
 
 
-def linkedin_salary_from_pane(driver) -> str:
-    """Read the compensation element from the LinkedIn detail pane.
+def linkedin_wait_for_description(driver, job_id, timeout=18.0) -> str:
+    """Poll the description pane for the specific job id we just clicked.
 
-    Returns "" when absent, in which case the caller falls back to parsing the
-    description. Ontario postings are required to state a range, so the number
-    is usually in the description even when the structured field is empty.
+    Keying the wait on the job id (rather than comparing text against the
+    previous job's description) means we know precisely when the right pane
+    has caught up, instead of guessing from a timeout.
     """
-    sels = [
-        ".jobs-unified-top-card__salary-details",
-        ".job-details-jobs-unified-top-card__job-insight span",
-        ".compensation__salary",
-        "[class*='salary']",
-    ]
-    for sel in sels:
-        try:
-            for el in driver.find_elements(By.CSS_SELECTOR, sel):
-                txt = (el.text or "").strip()
-                if txt and "$" in txt:
-                    return txt
-        except Exception:
-            continue
-    return ""
-
-
-def linkedin_company_from_pane(driver) -> str:
-    sels = [
-        ".job-details-jobs-unified-top-card__company-name a",
-        ".job-details-jobs-unified-top-card__company-name",
-        ".jobs-unified-top-card__company-name a",
-        ".jobs-unified-top-card__company-name",
-        'a[data-tracking-control-name="public_jobs_topcard-org-name"]',
-        'a[data-control-name="company_link"]',
-    ]
-    for sel in sels:
+    end = time.time() + timeout
+    sel = f'[id="JobDetails_AboutTheJob_{job_id}"]'
+    while time.time() < end:
         try:
             el = driver.find_element(By.CSS_SELECTOR, sel)
             txt = el.text.strip()
             if txt:
-                return txt
+                return re.sub(r"^About the job\s*\n*", "", txt).strip()
         except Exception:
-            continue
+            pass
+        time.sleep(0.3)
     return ""
 
 
@@ -630,9 +657,6 @@ def linkedin_company_from_pane(driver) -> str:
 def scrape_linkedin_authenticated(driver, seen_signatures, seen_urls, new_jobs_buffer):
     print("\n\n=== STARTING LINKEDIN CHECK (AUTHENTICATED) ===")
 
-    # Initialize prev_description outside the loops to track across jobs
-    prev_description = ""
-
     for kw in KEYWORDS:
         print(f"\n--- LinkedIn Search: {kw} ---")
 
@@ -640,41 +664,6 @@ def scrape_linkedin_authenticated(driver, seen_signatures, seen_urls, new_jobs_b
                       f"&location={LOCATION.replace(' ', '%20')}")
         driver.get(search_url)
         time.sleep(5)
-
-        # DIAGNOSTIC: record page structure and selector counts to debug missing cards
-        try:
-            print(f"   [DIAG] URL loaded: {driver.current_url}")
-            html = driver.page_source
-            # Save a snapshot for offline inspection
-            with open("linkedin_debug_page.html", "w", encoding="utf-8") as fh:
-                fh.write(html)
-
-            selectors_to_check = [
-                ".job-card-container",
-                "div.job-card-container",
-                "li.jobs-search-results__list-item",
-                "div.jobs-search-result-card",
-                "div.job-card-list__entity-lockup",
-                "div.base-card",
-                "a.job-card-list__title",
-                "a.job-card-container__link",
-                "h3.base-search-card__title",
-            ]
-            for sel in selectors_to_check:
-                try:
-                    els = driver.find_elements(By.CSS_SELECTOR, sel)
-                    print(f"   [DIAG] selector '{sel}' -> {len(els)} elements")
-                except Exception as e:
-                    print(f"   [DIAG] selector '{sel}' error: {e}")
-
-            # check for presence of main results container
-            try:
-                containers = driver.find_elements(By.CSS_SELECTOR, "div.jobs-search-results-list, ul.jobs-search__results-list, div.jobs-search-results")
-                print(f"   [DIAG] results container candidates: {len(containers)}")
-            except Exception:
-                pass
-        except Exception as e:
-            print(f"   [DIAG] page snapshot failed: {e}")
 
         current_page_num = 1
 
@@ -689,122 +678,23 @@ def scrape_linkedin_authenticated(driver, seen_signatures, seen_urls, new_jobs_b
 
             print(f"   Processing Page {current_page_num}...")
 
-            # Wait for any known job-card selector to appear (handles LinkedIn markup variants)
-            card_selectors = [
-                ".job-card-container",
-                "div.job-card-container",
-                "li.jobs-search-results__list-item",
-                "div.jobs-search-result-card",
-                "div.job-card-list__entity-lockup",
-                "div.base-card",
-                ".jobs-search-results__list li",
-                "ul.jobs-search__results-list li",
-            ]
-            found_cards = False
+            # Give the (virtualized) list a moment to render, then scroll it so
+            # LinkedIn mounts cards beyond the first screenful.
             end_time = time.time() + 10
+            cards = []
             while time.time() < end_time:
-                for sel in card_selectors:
-                    try:
-                        elems = driver.find_elements(By.CSS_SELECTOR, sel)
-                        if elems:
-                            found_cards = True
-                            break
-                    except Exception:
-                        continue
-                if found_cards:
+                cards = linkedin_extract_cards(driver)
+                if cards:
                     break
                 time.sleep(0.3)
 
-            if not found_cards:
-                ts = time.strftime("%Y%m%d-%H%M%S")
-                cur_url = driver.current_url
-                ua = driver.execute_script("return navigator.userAgent;")
-                fname_html = f"linkedin_debug_missing_cards_{ts}.html"
-                fname_png = f"linkedin_debug_missing_cards_{ts}.png"
-                try:
-                    with open(fname_html, "w", encoding="utf-8") as fh:
-                        fh.write(f"<!-- URL: {cur_url} -->\n<!-- UA: {ua} -->\n" + driver.page_source)
-                    try:
-                        driver.save_screenshot(fname_png)
-                    except Exception:
-                        pass
-                    print(f"   [ERROR] No job cards found on this page. Saved snapshot: {fname_html} {fname_png}")
-                except Exception as e:
-                    print(f"   [ERROR] No job cards and snapshot failed: {e}")
+            if not cards:
+                print("   [ERROR] No job cards found on this page.")
                 break
 
-            # Scroll the relevant results container (handles virtualized lists).
-            # Use the first card found from any of the known selectors rather than
-            # assuming ".job-card-container" always exists (LinkedIn has variants).
-            try:
-                # Try a set of selectors we already use above to locate a representative card
-                card_selectors_list = [
-                    ".job-card-container",
-                    "div.job-card-container",
-                    "li.jobs-search-results__list-item",
-                    "div.jobs-search-result-card",
-                    "div.job-card-list__entity-lockup",
-                    "div.base-card",
-                    ".jobs-search-results__list li",
-                    "ul.jobs-search__results-list li",
-                ]
-                first_card = None
-                for sel in card_selectors_list:
-                    try:
-                        elems = driver.find_elements(By.CSS_SELECTOR, sel)
-                        if elems:
-                            first_card = elems[0]
-                            break
-                    except Exception:
-                        continue
-
-                # Find the nearest scrollable ancestor via JS and return it
-                find_scrollable = (
-                    "function findScrollable(el){"
-                    "  while(el){"
-                    "    var s = window.getComputedStyle(el);"
-                    "    if (/(auto|scroll)/.test(s.overflowY) && el.scrollHeight>el.clientHeight) return el;"
-                    "    el = el.parentElement;"
-                    "  }"
-                    "  return document.scrollingElement || document.documentElement;"
-                    "}"
-                    "return findScrollable(arguments[0]);"
-                )
-
-                scroll_container = None
-                if first_card is not None:
-                    try:
-                        scroll_container = driver.execute_script(find_scrollable, first_card)
-                    except Exception:
-                        scroll_container = None
-
-                if scroll_container:
-                    # Gradually scroll the container to force virtualization to render items
-                    for _ in range(12):
-                        try:
-                            driver.execute_script(
-                                "arguments[0].scrollTop = Math.min(arguments[0].scrollTop + arguments[0].clientHeight*0.8, arguments[0].scrollHeight);",
-                                scroll_container,
-                            )
-                        except Exception:
-                            break
-                        time.sleep(0.45)
-                else:
-                    # Fallback to full-page scroll if no container was found
-                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                    time.sleep(2)
-            except Exception:
-                # Last-resort full page scroll
-                try:
-                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                    time.sleep(2)
-                except Exception:
-                    pass
-
-            # Try multiple container selectors because LinkedIn changes markup
-            cards = driver.find_elements(By.CSS_SELECTOR,
-                ".job-card-container, div.job-card-container, li.jobs-search-results__list-item, div.jobs-search-result-card, div.job-card-list__entity-lockup, .jobs-search-results__list li, div.base-card"
-            )
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(1.5)
+            cards = linkedin_extract_cards(driver) or cards
 
             print(f"      Found {len(cards)} visible cards.")
 
@@ -813,208 +703,32 @@ def scrape_linkedin_authenticated(driver, seen_signatures, seen_urls, new_jobs_b
                     return
 
                 try:
-                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", card)
-                    time.sleep(0.1)
-
-                    card_html = card.get_attribute("outerHTML")
-
-                    # Title (and safe title_elem)
-                    title_elem = None
-                    try:
-                        title_elem = card.find_element(By.CSS_SELECTOR, ".job-card-list__title")
-                        raw_title = fix_doubled_title(title_elem.text.strip())
-                    except Exception:
-                        raw_title = linkedin_title_from_card_html(card_html)
-
-                    job_url = linkedin_url_from_card(card)
+                    job_id = card["job_id"]
+                    raw_title = fix_doubled_title(card["title"])
+                    raw_company = norm(card["company"])
+                    job_url = f"https://www.linkedin.com/jobs/view/{job_id}/"
 
                     if is_missing(raw_title):
                         if DEBUG_EVERY_SKIP:
-                            dbg("LI_SKIP", reason="missing title on card")
+                            dbg("LI_SKIP", reason=f"missing title on card {job_id}")
                         continue
 
-                    # Duplicate URL check
-                    if canonical_url(job_url) and canonical_url(job_url) in seen_urls:
+                    if canonical_url(job_url) in seen_urls:
                         if DEBUG_EVERY_SKIP:
                             dbg("LI_SKIP_DUP_URL", title=raw_title, url=job_url, reason="url already seen")
                         continue
 
-                    dbg("LI_CARD", title=raw_title, url=job_url)
-
-                    # Click card to load pane
-                    print(f"      [CLICKING] {raw_title}")
-                    try:
-                        # Prefer clicking the anchor inside the card if present
-                        clicked = False
-                        try:
-                            clickable = card.find_element(By.CSS_SELECTOR, "a.job-card-list__title, a.job-card-container__link, a[href*='/jobs/view'], a[href*='/jobs/']")
-                            driver.execute_script("arguments[0].click();", clickable)
-                            clicked = True
-                        except Exception:
-                            pass
-
-                        if not clicked:
-                            if title_elem:
-                                try:
-                                    title_elem.click()
-                                    clicked = True
-                                except Exception:
-                                    pass
-
-                        if not clicked:
-                            driver.execute_script("arguments[0].click();", card)
-
-                    except Exception:
-                        if DEBUG_EVERY_SKIP:
-                            dbg("LI_SKIP", title=raw_title, url=job_url, reason="click failed")
-                        continue
-
-                    # --- SYNCHRONIZATION: Wait for Pane Title to Match Card Title ---
-                    pane_matched = False
-                    
-                    # Try to find the title in the detail pane
-                    pane_title_selectors = [
-                        ".job-details-jobs-unified-top-card__job-title",
-                        ".jobs-unified-top-card__job-title",
-                        "h2.t-24", # Common LinkedIn header class
-                        "[data-test-job-details-header-title]"
-                    ]
-
-                    for _ in range(15): # ~3 seconds check
-                        for sel in pane_title_selectors:
-                            try:
-                                el = driver.find_element(By.CSS_SELECTOR, sel)
-                                txt = fix_doubled_title(el.text.strip())
-                                if not txt: continue
-                                
-                                # Compare card title vs pane title
-                                if raw_title.lower() in txt.lower() or txt.lower() in raw_title.lower():
-                                    pane_matched = True
-                                    break
-                            except Exception:
-                                pass
-                        if pane_matched:
-                            break
-                        time.sleep(0.2)
-
-                    def _dismiss_linkedin_signin_modals(drv):
-                        # Try clicking common modal close outlets or remove modal nodes via JS
-                        modal_selectors = [
-                            "div.modal--contextual-sign-in",
-                            "div[data-outlet*='job-details-topcard']",
-                            "div[data-outlet*='topcard']",
-                        ]
-                        close_selectors = [
-                            "button[data-modal]",
-                            "button[aria-label='Close']",
-                            "button.sign-up-modal__outlet",
-                            "button[title='Close']",
-                        ]
-                        try:
-                            for sel in close_selectors:
-                                try:
-                                    els = drv.find_elements(By.CSS_SELECTOR, sel)
-                                    for e in els:
-                                        try:
-                                            drv.execute_script("arguments[0].click();", e)
-                                        except Exception:
-                                            pass
-                                except Exception:
-                                    pass
-                            # As last resort remove modal elements from DOM so pane is accessible
-                            for sel in modal_selectors:
-                                try:
-                                    drv.execute_script(
-                                        "var els=document.querySelectorAll(arguments[0]); els.forEach(function(e){ e.parentNode && e.parentNode.removeChild(e); });",
-                                        sel,
-                                    )
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-
-                    # If pane didn't match, attempt to dismiss sign-in modal and retry a few times
-                    if not pane_matched:
-                        retried = False
-                        for attempt in range(3):
-                            _dismiss_linkedin_signin_modals(driver)
-                            time.sleep(0.6)
-                            # retry pane match quickly
-                            for sel in pane_title_selectors:
-                                try:
-                                    el = driver.find_element(By.CSS_SELECTOR, sel)
-                                    txt = fix_doubled_title(el.text.strip())
-                                    if not txt:
-                                        continue
-                                    if raw_title.lower() in txt.lower() or txt.lower() in raw_title.lower():
-                                        pane_matched = True
-                                        break
-                                except Exception:
-                                    pass
-                            if pane_matched:
-                                retried = True
-                                break
-                        if not pane_matched:
-                            # As a robust fallback, open the job URL in a new tab and read details
-                            if job_url:
-                                try:
-                                    original = driver.current_window_handle
-                                    driver.execute_script("window.open(arguments[0], '_blank');", job_url)
-                                    time.sleep(1.2)
-                                    handles = driver.window_handles
-                                    for h in handles:
-                                        if h != original:
-                                            driver.switch_to.window(h)
-                                            time.sleep(2)
-                                            # Try to read main job description on the job page
-                                            desc_text = ""
-                                            try:
-                                                # common selectors for a job page description
-                                                for ds in ["div.description__text", "div.jobs-description", "div[class*='show-more']", "div[class*='description']"]:
-                                                    try:
-                                                        el = driver.find_element(By.CSS_SELECTOR, ds)
-                                                        desc_text = el.text.strip()
-                                                        if desc_text:
-                                                            break
-                                                    except Exception:
-                                                        continue
-                                            except Exception:
-                                                desc_text = ""
-                                            # Close the tab and switch back
-                                            driver.close()
-                                            driver.switch_to.window(original)
-                                            if desc_text:
-                                                # Use this description as the pane text for downstream checks
-                                                description = desc_text
-                                                pane_matched = True
-                                            break
-                                except Exception:
-                                    pass
-
-                        if not pane_matched:
-                             # Final fallback: skip this card if pane never matched
-                             if DEBUG_EVERY_SKIP:
-                                dbg("LI_SKIP_SYNC", title=raw_title, reason="Pane did not update to match card title")
-                             continue
-
-                    # Company from pane (now safe to read)
-                    raw_company = linkedin_company_from_pane(driver)
-                    dbg("LI_PANE_SYNCED", title=raw_title, company=raw_company, url=job_url)
-
                     if REQUIRE_COMPANY and is_missing(raw_company):
                         if DEBUG_EVERY_SKIP:
-                            dbg("LI_SKIP", title=raw_title, company=raw_company, url=job_url,
-                                reason="company not found in pane")
+                            dbg("LI_SKIP", title=raw_title, url=job_url, reason="missing company on card")
                         continue
 
-                    # Duplicates by sig
                     sig = (raw_title.lower().strip(), raw_company.lower().strip())
                     if sig in seen_signatures:
                         if DEBUG_EVERY_SKIP:
                             dbg("LI_SKIP_DUP_SIG", title=raw_title, company=raw_company, url=job_url, reason="duplicate")
                         continue
 
-                    # Keywords filter
                     title_lower = raw_title.lower()
                     if any(bad in title_lower for bad in BAD_KEYWORDS):
                         if DEBUG_EVERY_SKIP:
@@ -1032,26 +746,26 @@ def scrape_linkedin_authenticated(driver, seen_signatures, seen_urls, new_jobs_b
                             dbg("LI_SKIP", title=raw_title, company=raw_company, reason="irrelevant title")
                         continue
 
-                    # Description - STRICT PREV_DESC CHECK
-                    description = "N/A"
-                    start_desc_time = time.time()
-                    while (time.time() - start_desc_time) < 6.0:
-                        try:
-                            desc_elem = driver.find_element(By.ID, "job-details")
-                            txt = desc_elem.text.strip()
-                            # Ensure text exists AND is different from previous job description
-                            if txt and (txt != prev_description or prev_description == ""):
-                                description = txt
-                                break
-                        except Exception:
-                            pass
-                        time.sleep(0.5)
+                    dbg("LI_CARD", title=raw_title, company=raw_company, url=job_url)
+                    print(f"      [CLICKING] {raw_title}")
 
-                    # Update the previous description tracker
-                    if description != "N/A":
-                        prev_description = description
+                    if not linkedin_click_card(driver, job_id):
+                        if DEBUG_EVERY_SKIP:
+                            dbg("LI_SKIP", title=raw_title, url=job_url, reason="click failed")
+                        continue
 
-                    # Decide save
+                    description = linkedin_wait_for_description(driver, job_id)
+                    if not description:
+                        # Under a long, heavy scraping session LinkedIn's pane
+                        # sometimes renders slower than the wait allows, or the
+                        # first click doesn't register -- one re-click clears
+                        # the vast majority of these instead of giving up.
+                        if DEBUG_EVERY_SKIP:
+                            dbg("LI_RETRY_DESC", title=raw_title, url=job_url, reason="description wait timed out, retrying click")
+                        linkedin_click_card(driver, job_id)
+                        description = linkedin_wait_for_description(driver, job_id)
+                    description = description or "N/A"
+
                     should_save = False
                     if relevance_type == "KEEP_IMMEDIATE":
                         should_save = True
@@ -1066,22 +780,21 @@ def scrape_linkedin_authenticated(driver, seen_signatures, seen_urls, new_jobs_b
                                     reason="ambiguous, no tech keywords")
 
                     if should_save:
-                        # LinkedIn shows compensation in a dedicated element on
-                        # some postings and inline in the description on others.
-                        salary_text = linkedin_salary_from_pane(driver)
+                        # LinkedIn rarely populates a structured compensation
+                        # field; annotate_job() pulls the range out of the
+                        # description text via best_salary() instead.
                         data = {
                             "title": raw_title,
-                            "url": job_url or "N/A",
+                            "url": job_url,
                             "company": raw_company,
                             "description": description,
-                            "salary": clean_salary_text(salary_text) if salary_text else "N/A",
+                            "salary": "N/A",
                             "qualifications": "N/A",
                             "scraped_at": time.strftime("%Y-%m-%d %H:%M:%S")
                         }
                         annotate_job(data)
                         new_jobs_buffer.append(data)
-                        if job_url:
-                            seen_urls.add(canonical_url(job_url))
+                        seen_urls.add(canonical_url(job_url))
                         seen_signatures.add(sig)
                         dbg("LI_BUFFERED", title=raw_title, company=raw_company,
                             salary=data["salary"], url=job_url)
@@ -1388,16 +1101,23 @@ def run_scraper():
                                 dbg("ERROR_CARD_SH", reason=f"{type(e).__name__}: {str(e)[:120]}")
                             continue
 
-                        if total_saved_this_run >= MAX_JOBS_TO_SCRAPE:
-                            break
+                    # Advance to the next page ONCE per page (this used to sit
+                    # inside the `for` loop above, so it fired -- and could
+                    # fail -- once per CARD. When it failed on the last real
+                    # page, `break` only exited that inner `for`, never the
+                    # `while page_num <= MAX_PAGES_PER_KEYWORD` loop, so the
+                    # scraper reprocessed the same stuck page forever instead
+                    # of moving to the next keyword.
+                    if total_saved_this_run >= MAX_JOBS_TO_SCRAPE:
+                        break
 
-                        try:
-                            next_btn = driver.find_element(By.CSS_SELECTOR, "a[aria-label='Next page']")
-                            driver.execute_script("arguments[0].click();", next_btn)
-                            page_num += 1
-                            time.sleep(3)
-                        except Exception:
-                            break
+                    try:
+                        next_btn = driver.find_element(By.CSS_SELECTOR, "a[aria-label='Next page']")
+                        driver.execute_script("arguments[0].click();", next_btn)
+                        page_num += 1
+                        time.sleep(3)
+                    except Exception:
+                        break
 
                     # MAX_JOBS_TO_SCRAPE is a run-wide cap. Without this the inner
                     # breaks only ended the current keyword, and the next keyword
