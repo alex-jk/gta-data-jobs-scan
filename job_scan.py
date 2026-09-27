@@ -1290,17 +1290,31 @@ def export_unique_jobs(target: float = SALARY_TARGET_CAD):
     shortlist = df if not EXCLUDE_BELOW_TARGET else df[df["salary_status"] != SALARY_STATUS_BELOW]
     shortlist = shortlist.copy()
 
-    # Confirmed matches first, then unpublished salaries, each ranked by how
-    # well the posting fits the profile.
+    # ml_relevant (from flag_relevant_jobs.py) outranks everything else when
+    # present: hands-on modeling/ML postings first, then within each group,
+    # confirmed salary matches before unpublished salaries, ranked by fit.
+    sort_cols = []
+    ascending = []
+    drop_cols = []
+    if "ml_relevant" in shortlist.columns:
+        shortlist["_ml_rank"] = (~shortlist["ml_relevant"].fillna(False).astype(bool)).astype(int)
+        sort_cols.append("_ml_rank")
+        ascending.append(True)
+        drop_cols.append("_ml_rank")
+
     shortlist["_rank"] = shortlist["salary_status"].map(
         {SALARY_STATUS_MEETS: 0, SALARY_STATUS_UNKNOWN: 1, SALARY_STATUS_BELOW: 2}
     ).fillna(3)
-    sort_cols = ["_rank"] + [
-        c for c in ("fit_score", "salary_max_annual") if c in shortlist.columns
-    ]
-    shortlist = shortlist.sort_values(
-        by=sort_cols, ascending=[True] + [False] * (len(sort_cols) - 1)
-    ).drop(columns=["_rank"])
+    sort_cols.append("_rank")
+    ascending.append(True)
+    drop_cols.append("_rank")
+
+    for c in ("fit_score", "salary_max_annual"):
+        if c in shortlist.columns:
+            sort_cols.append(c)
+            ascending.append(False)
+
+    shortlist = shortlist.sort_values(by=sort_cols, ascending=ascending).drop(columns=drop_cols)
 
     shortlist.to_csv(UNIQUE_JOBS_FILE, index=False, encoding="utf-8")
 
